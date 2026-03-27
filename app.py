@@ -1,8 +1,11 @@
 from flask import Flask, request, jsonify
 import base64
 import io
+import tempfile
+import os
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 from PIL import Image
 
 app = Flask(__name__)
@@ -26,8 +29,9 @@ def create_stamp_overlay(page_width, page_height, img_bytes, position, stamp_w, 
     pos_fn = POSITIONS.get(position, POSITIONS["bottom-right"])
     x, y = pos_fn(page_width, page_height, stamp_w, stamp_h)
 
-    img_buffer = io.BytesIO(img_bytes)
-    c.drawImage(img_buffer, x, y, width=stamp_w, height=stamp_h, mask="auto")
+    # ✅ Fix: Use ImageReader instead of BytesIO directly
+    img_reader = ImageReader(io.BytesIO(img_bytes))
+    c.drawImage(img_reader, x, y, width=stamp_w, height=stamp_h, mask="auto")
     c.save()
 
     packet.seek(0)
@@ -36,7 +40,6 @@ def create_stamp_overlay(page_width, page_height, img_bytes, position, stamp_w, 
 
 @app.route("/stamp", methods=["POST"])
 def stamp_pdf():
-    # Auth
     if request.headers.get("x-api-key") != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -44,12 +47,12 @@ def stamp_pdf():
     if not data:
         return jsonify({"error": "No JSON body"}), 400
 
-    pdf_b64       = data.get("pdf")
-    signature_b64 = data.get("signature")
-    position      = data.get("position", "bottom-right")   # bottom-right / bottom-left / top-right / top-left / center
-    pages_option  = data.get("pages", "last")              # "all" / "first" / "last"
-    stamp_width   = int(data.get("stamp_width",  150))     # px width of stamp on page
-    stamp_height  = int(data.get("stamp_height",  75))     # px height of stamp on page
+    pdf_b64        = data.get("pdf")
+    signature_b64  = data.get("signature")
+    position       = data.get("position", "bottom-right")
+    pages_option   = data.get("pages", "last")
+    stamp_width    = int(data.get("stamp_width",  150))
+    stamp_height   = int(data.get("stamp_height",  75))
 
     if not pdf_b64 or not signature_b64:
         return jsonify({"error": "Both 'pdf' and 'signature' (base64) are required"}), 400
