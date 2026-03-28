@@ -1,5 +1,5 @@
 flask
-pypdf
-reportlab
+pypdf2
+pdfminer.six
 pillow
-gunicorn
+pymupdf
