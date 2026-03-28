@@ -1,111 +1,178 @@
-from flask import Flask, request, jsonify
+####################################################
+# PDF STAMP API — Python Version
+# Word-Find Edition
+# Dependencies: flask, pymupdf, pillow
+####################################################
+
 import base64
 import io
-import tempfile
-import os
-from pypdf import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
+import json
+from flask import Flask, request, jsonify
+import fitz        # PyMuPDF  ← finds words + stamps
 from PIL import Image
 
 app = Flask(__name__)
-
 API_KEY = "PDF_Stamp"
 
-POSITIONS = {
-    "bottom-right":  lambda pw, ph, sw, sh: (pw - sw - 30, 20),
-    "bottom-left":   lambda pw, ph, sw, sh: (30, 20),
-    "top-right":     lambda pw, ph, sw, sh: (pw - sw - 30, ph - sh - 20),
-    "top-left":      lambda pw, ph, sw, sh: (30, ph - sh - 20),
-    "center":        lambda pw, ph, sw, sh: ((pw - sw) / 2, (ph - sh) / 2),
-}
 
-
-def create_stamp_overlay(page_width, page_height, img_bytes, position, stamp_w, stamp_h):
-    """Create a single-page PDF overlay containing the signature image."""
-    packet = io.BytesIO()
-    c = canvas.Canvas(packet, pagesize=(page_width, page_height))
-
-    pos_fn = POSITIONS.get(position, POSITIONS["bottom-right"])
-    x, y = pos_fn(page_width, page_height, stamp_w, stamp_h)
-
-    # ✅ Fix: Use ImageReader instead of BytesIO directly
-    img_reader = ImageReader(io.BytesIO(img_bytes))
-    c.drawImage(img_reader, x, y, width=stamp_w, height=stamp_h, mask="auto")
-    c.save()
-
-    packet.seek(0)
-    return packet.read()
-
-
-@app.route("/stamp", methods=["POST"])
-def stamp_pdf():
+# ── AUTH ──────────────────────────────────────────
+@app.before_request
+def check_auth():
+    if request.path == "/":
+        return  # skip auth for health check
     if request.headers.get("x-api-key") != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No JSON body"}), 400
 
-    pdf_b64        = data.get("pdf")
-    signature_b64  = data.get("signature")
-    position       = data.get("position", "bottom-right")
-    pages_option   = data.get("pages", "last")
-    stamp_width    = int(data.get("stamp_width",  150))
-    stamp_height   = int(data.get("stamp_height",  75))
+# ── HEALTH CHECK ──────────────────────────────────
+@app.route("/")
+def health():
+    return jsonify({"status": "PDF Stamp API Running ✅"})
 
-    if not pdf_b64 or not signature_b64:
-        return jsonify({"error": "Both 'pdf' and 'signature' (base64) are required"}), 400
 
-    if position not in POSITIONS:
-        return jsonify({"error": f"Invalid position. Choose from: {list(POSITIONS.keys())}"}), 400
-
+# ── STAMP ENDPOINT ────────────────────────────────
+@app.route("/stamp", methods=["POST"])
+def stamp():
     try:
-        pdf_bytes = base64.b64decode(pdf_b64)
-        sig_bytes = base64.b64decode(signature_b64)
+        data = request.get_json()
 
-        # Validate image
-        Image.open(io.BytesIO(sig_bytes)).verify()
+        if not data or "pdf" not in data or "signature" not in data:
+            return jsonify({"error": "pdf and signature are required"}), 400
 
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        writer = PdfWriter()
-        total  = len(reader.pages)
+        # ── Read inputs ───────────────────────────
+        pdf_bytes = base64.b64decode(data["pdf"])
+        sig_bytes = base64.b64decode(data["signature"])
 
-        if pages_option == "all":
-            target_pages = set(range(total))
-        elif pages_option == "first":
-            target_pages = {0}
-        else:  # last
-            target_pages = {total - 1}
+        search_word  = data.get("search_word", "")
+        occurrence   = data.get("occurrence", "last")     # first | last | all
+        position     = data.get("position", "bottom-right")
+        stamp_width  = float(data.get("stamp_width", 150))
+        stamp_height = float(data.get("stamp_height", 75))
+        padding      = float(data.get("padding", 6))
 
-        for i, page in enumerate(reader.pages):
-            if i in target_pages:
-                pw = float(page.mediabox.width)
-                ph = float(page.mediabox.height)
+        # ── Convert signature to PNG (PIL) ────────
+        sig_image = Image.open(io.BytesIO(sig_bytes)).convert("RGBA")
+        sig_png_io = io.BytesIO()
+        sig_image.save(sig_png_io, format="PNG")
+        sig_png_bytes = sig_png_io.getvalue()
 
-                overlay_bytes = create_stamp_overlay(
-                    pw, ph, sig_bytes, position, stamp_width, stamp_height
-                )
-                overlay_page = PdfReader(io.BytesIO(overlay_bytes)).pages[0]
-                page.merge_page(overlay_page)
+        # ── Open PDF with PyMuPDF ─────────────────
+        pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-            writer.add_page(page)
+        stamp_targets = []
+        word_found    = False
 
-        output = io.BytesIO()
-        writer.write(output)
-        output.seek(0)
+        # ── Search for word ───────────────────────
+        if search_word:
+            all_matches = []
 
-        result_b64 = base64.b64encode(output.read()).decode("utf-8")
-        return jsonify({"pdf": result_b64}), 200
+            for page_num in range(len(pdf_doc)):
+                page = pdf_doc[page_num]
+                # search_for returns list of Rect objects for each match
+                instances = page.search_for(search_word)
+
+                for rect in instances:
+                    all_matches.append({
+                        "page":   page_num,
+                        "x":      rect.x0,
+                        "y":      rect.y0,       # top of word (PyMuPDF: y increases downward)
+                        "width":  rect.width,
+                        "height": rect.height,
+                        "rect":   rect
+                    })
+
+            if all_matches:
+                word_found = True
+                if occurrence == "first":
+                    stamp_targets = [all_matches[0]]
+                elif occurrence == "last":
+                    stamp_targets = [all_matches[-1]]
+                else:
+                    stamp_targets = all_matches
+
+        # ── Place stamp ───────────────────────────
+        if stamp_targets:
+            # Word found → stamp ABOVE the word
+            for target in stamp_targets:
+                page = pdf_doc[target["page"]]
+
+                # Match stamp width to word width (capped at stamp_width)
+                sW = min(target["width"] * 1.1, stamp_width)
+                sH = stamp_height
+
+                # PyMuPDF: y=0 is TOP, increases downward
+                # So "above the word" = word y0 - stamp height - padding
+                stamp_x = target["x"]
+                stamp_y = target["y"] - sH - padding
+
+                # Clamp so stamp doesn't go off page
+                stamp_y = max(stamp_y, 0)
+
+                stamp_rect = fitz.Rect(stamp_x, stamp_y, stamp_x + sW, stamp_y + sH)
+                page.insert_image(stamp_rect, stream=sig_png_bytes)
+
+        else:
+            # Word not found → fallback fixed position
+            for page in pdf_doc:
+                pgW = page.rect.width
+                pgH = page.rect.height
+                sW  = stamp_width
+                sH  = stamp_height
+
+                if position == "bottom-right":
+                    x, y = pgW - sW - 20, pgH - sH - 20
+                elif position == "bottom-left":
+                    x, y = 20, pgH - sH - 20
+                elif position == "top-right":
+                    x, y = pgW - sW - 20, 20
+                elif position == "top-left":
+                    x, y = 20, 20
+                elif position == "center":
+                    x, y = (pgW - sW) / 2, (pgH - sH) / 2
+                else:
+                    x, y = pgW - sW - 20, pgH - sH - 20
+
+                stamp_rect = fitz.Rect(x, y, x + sW, y + sH)
+                page.insert_image(stamp_rect, stream=sig_png_bytes)
+
+        # ── Save & return ─────────────────────────
+        output_bytes  = pdf_doc.tobytes()
+        output_base64 = base64.b64encode(output_bytes).decode("utf-8")
+
+        return jsonify({
+            "pdf":        output_base64,
+            "word_found": word_found
+        })
 
     except Exception as e:
+        print(f"❌ Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=3000)
+```
+
+---
+
+### Step 4: Check your `render.yaml` or Start Command
+In Render → **Settings** → **Start Command**, make sure it says:
+```
+python app.py
+```
+*(or whatever your main file is named)*
+
+---
+
+### Step 5: Commit & Push to GitHub
+After saving both files on GitHub, Render will **auto-deploy**. Watch the **Logs** tab — it should show:
+```
+✅ Server running on port ...
+```
+
+---
+
+### Step 6: Test the health check
+Open in browser:
+```
+https://pdf-stamp-api-tcau.onrender.com/
