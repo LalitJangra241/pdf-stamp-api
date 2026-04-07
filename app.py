@@ -12,12 +12,14 @@ Features:
 - Occurrence selection: "all", "first", "last"
 - Optional date text above the stamp
 - flip_x / flip_y axis correction support
+- Request size guard (50 MB limit)
 """
 
 import os
 import io
 import base64
 import logging
+from functools import lru_cache
 from flask import Flask, request, jsonify
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
@@ -29,29 +31,40 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Set PDF_STAMP_API_KEY env var on Render, or leave default "PDF_Stamp"
-API_KEY = os.environ.get("PDF_STAMP_API_KEY", "PDF_Stamp")
+API_KEY        = os.environ.get("PDF_STAMP_API_KEY", "PDF_Stamp")
+MAX_BODY_BYTES = 50 * 1024 * 1024   # 50 MB hard limit
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
-def check_auth(req):
+def check_auth(req) -> bool:
     return req.headers.get("x-api-key") == API_KEY
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+def _to_float(value, default=None):
+    """Safely coerce a value to float; return default if not possible."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ─── Page parsing ──────────────────────────────────────────────────────────────
 
-def parse_pages(page_str, total_pages):
+@lru_cache(maxsize=256)
+def _parse_pages_cached(page_str: str, total_pages: int):
     """
-    Parse page string into 0-based list of page indices.
+    Parse page string into a tuple of 0-based page indices (cached).
     Accepts: "all", "1", "1-3", "1,3,5"
     """
-    if not page_str or str(page_str).strip().lower() == "all":
-        return list(range(total_pages))
+    if not page_str or page_str.strip().lower() == "all":
+        return tuple(range(total_pages))
 
-    page_str = str(page_str).strip()
     indices = set()
-
     for part in page_str.split(","):
         part = part.strip()
         if "-" in part:
@@ -64,11 +77,15 @@ def parse_pages(page_str, total_pages):
             if 1 <= p <= total_pages:
                 indices.add(p - 1)
 
-    return sorted(indices)
+    return tuple(sorted(indices))
 
 
-def filter_occurrence(page_indices, occurrence):
-    """Filter page list by occurrence: all / first / last"""
+def parse_pages(page_str, total_pages) -> list:
+    return list(_parse_pages_cached(str(page_str).strip(), total_pages))
+
+
+def filter_occurrence(page_indices: list, occurrence: str) -> list:
+    """Filter page list by occurrence: all / first / last."""
     if not page_indices:
         return page_indices
     occ = str(occurrence).strip().lower()
@@ -76,29 +93,63 @@ def filter_occurrence(page_indices, occurrence):
         return [page_indices[0]]
     if occ == "last":
         return [page_indices[-1]]
-    return page_indices  # "all"
+    return page_indices
+
+
+# ─── Stamp size resolver ───────────────────────────────────────────────────────
+
+def _resolve_stamp_size(
+    page_w: float,
+    page_h: float,
+    stamp_width_percent,
+    stamp_height_percent,
+    stamp_width_px,
+    stamp_height_px,
+) -> tuple:
+    """
+    Return (stamp_w_pt, stamp_h_pt) using the first available sizing method:
+      1. Percent of page dimensions (M6 / N6)
+      2. Legacy fixed points/px
+      3. Default 15% × 10%
+    """
+    if stamp_width_percent is not None and stamp_height_percent is not None:
+        sw = (stamp_width_percent / 100.0) * page_w
+        sh = (stamp_height_percent / 100.0) * page_h
+        logger.info(
+            "Stamp size (percent): %.0f%%w x %.0f%%h → %.1f x %.1f pt",
+            stamp_width_percent, stamp_height_percent, sw, sh,
+        )
+    elif stamp_width_px is not None and stamp_height_px is not None:
+        sw, sh = float(stamp_width_px), float(stamp_height_px)
+        logger.info("Stamp size (fixed px): %.1f x %.1f pt", sw, sh)
+    else:
+        sw = 0.15 * page_w
+        sh = 0.10 * page_h
+        logger.info("Stamp size (default 15%%x10%%): %.1f x %.1f pt", sw, sh)
+
+    return sw, sh
 
 
 # ─── Stamp overlay builder ─────────────────────────────────────────────────────
 
 def build_stamp_overlay(
-    page_width_pt,
-    page_height_pt,
-    stamp_img_bytes,
-    x_percent,
-    y_percent,
-    stamp_width_pt,
-    stamp_height_pt,
-    date_text=None,
-    date_x_percent=None,
-    date_y_percent=None,
-    date_font_size=6,
-    flip_x=False,
-    flip_y=False,
-):
+    page_width_pt: float,
+    page_height_pt: float,
+    stamp_img_bytes: bytes,
+    x_percent: float,
+    y_percent: float,
+    stamp_width_pt: float,
+    stamp_height_pt: float,
+    date_text: str = None,
+    date_x_percent: float = None,
+    date_y_percent: float = None,
+    date_font_size: float = 6,
+    flip_x: bool = False,
+    flip_y: bool = False,
+) -> bytes:
     """
-    Build a transparent PDF overlay with the stamp (and optional date text).
-    ReportLab origin = bottom-left, Y increases upward.
+    Build a transparent PDF overlay containing the stamp and optional date text.
+    ReportLab origin = bottom-left; Y increases upward.
     Default (flip_y=False): 0% Y = top of page (screen convention).
     """
     packet = io.BytesIO()
@@ -107,35 +158,25 @@ def build_stamp_overlay(
     raw_x = (x_percent / 100.0) * page_width_pt
     raw_y = (y_percent / 100.0) * page_height_pt
 
-    # X position
-    if flip_x:
-        stamp_x = page_width_pt - raw_x - stamp_width_pt
-    else:
-        stamp_x = raw_x
+    stamp_x = (page_width_pt - raw_x - stamp_width_pt) if flip_x else raw_x
+    stamp_y = raw_y if flip_y else (page_height_pt - raw_y - stamp_height_pt)
 
-    # Y position — default: 0% = top, flip for ReportLab's bottom-left origin
-    if flip_y:
-        stamp_y = raw_y
-    else:
-        stamp_y = page_height_pt - raw_y - stamp_height_pt
-
-    # Draw stamp image
     try:
-        img = Image.open(io.BytesIO(stamp_img_bytes)).convert("RGBA")
-        img_reader = ImageReader(img)
-        c.drawImage(
-            img_reader,
-            stamp_x,
-            stamp_y,
-            width=stamp_width_pt,
-            height=stamp_height_pt,
-            mask="auto",
-        )
-    except Exception as e:
-        logger.error(f"Failed to draw stamp image: {e}")
+        with Image.open(io.BytesIO(stamp_img_bytes)) as img:
+            img_rgba   = img.convert("RGBA")
+            img_reader = ImageReader(img_rgba)
+            c.drawImage(
+                img_reader,
+                stamp_x,
+                stamp_y,
+                width=stamp_width_pt,
+                height=stamp_height_pt,
+                mask="auto",
+            )
+    except Exception as exc:
+        logger.error("Failed to draw stamp image: %s", exc)
         raise
 
-    # Draw optional date text just above the stamp
     if date_text:
         dx_pct = date_x_percent if date_x_percent is not None else x_percent
         dy_pct = date_y_percent if date_y_percent is not None else y_percent
@@ -143,93 +184,58 @@ def build_stamp_overlay(
         raw_dx = (dx_pct / 100.0) * page_width_pt
         raw_dy = (dy_pct / 100.0) * page_height_pt
 
-        if flip_x:
-            date_x = page_width_pt - raw_dx
-        else:
-            date_x = raw_dx
-
-        if flip_y:
-            date_y = raw_dy + stamp_height_pt + 2
-        else:
-            date_y = page_height_pt - raw_dy + 2
+        date_x = (page_width_pt - raw_dx) if flip_x else raw_dx
+        date_y = (raw_dy + stamp_height_pt + 2) if flip_y else (page_height_pt - raw_dy + 2)
 
         c.setFont("Helvetica", date_font_size)
         c.setFillColorRGB(0, 0, 0)
-        c.drawString(date_x, date_y, date_text)
+        c.drawString(date_x, date_y, str(date_text))
 
     c.save()
-    packet.seek(0)
-    return packet.read()
+    return packet.getvalue()
 
 
 # ─── Main stamping logic ───────────────────────────────────────────────────────
 
 def stamp_pdf(
-    pdf_bytes,
-    stamp_bytes,
-    x_percent,
-    y_percent,
-    stamp_width_percent=None,   # M6 value (e.g. 40 = 40% of page width)
-    stamp_height_percent=None,  # N6 value (e.g. 50 = 50% of page height)
-    stamp_width_px=None,        # Legacy: fixed points/px
-    stamp_height_px=None,       # Legacy: fixed points/px
+    pdf_bytes: bytes,
+    stamp_bytes: bytes,
+    x_percent: float,
+    y_percent: float,
+    stamp_width_percent=None,
+    stamp_height_percent=None,
+    stamp_width_px=None,
+    stamp_height_px=None,
     date_text=None,
     date_x_percent=None,
     date_y_percent=None,
-    date_font_size=6,
-    flip_x=False,
-    flip_y=False,
+    date_font_size: float = 6,
+    flip_x: bool = False,
+    flip_y: bool = False,
     pages="all",
     occurrence="all",
-):
-    """
-    Stamp a PDF and return the stamped PDF bytes.
-
-    Stamp sizing priority:
-      1. stamp_width_percent / stamp_height_percent  ← from M6 / N6 (recommended)
-      2. stamp_width_px / stamp_height_px            ← legacy fixed px fallback
-      3. Default: 15% width × 10% height
-    """
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    writer = PdfWriter()
+) -> bytes:
+    """Stamp a PDF and return the stamped PDF bytes."""
+    reader      = PdfReader(io.BytesIO(pdf_bytes))
+    writer      = PdfWriter()
     total_pages = len(reader.pages)
 
     target_indices = parse_pages(pages, total_pages)
     target_indices = filter_occurrence(target_indices, occurrence)
-    target_set = set(target_indices)
+    target_set     = set(target_indices)
 
-    logger.info(f"Total pages: {total_pages} | Stamping pages (0-based): {target_indices}")
+    logger.info("Total pages: %d | Stamping (0-based): %s", total_pages, target_indices)
 
     for i, page in enumerate(reader.pages):
         if i in target_set:
-            # Get page dimensions in PDF points (1pt = 1/72 inch)
             page_w = float(page.mediabox.width)
             page_h = float(page.mediabox.height)
 
-            # ── Resolve stamp size ──────────────────────────────────────────
-            if stamp_width_percent is not None and stamp_height_percent is not None:
-                # M6 / N6 percent-based (auto-scales to page)
-                sw = (stamp_width_percent / 100.0) * page_w
-                sh = (stamp_height_percent / 100.0) * page_h
-                logger.info(
-                    f"Page {i+1} ({page_w:.0f}x{page_h:.0f}pt): "
-                    f"Stamp {stamp_width_percent}%w x {stamp_height_percent}%h "
-                    f"→ {sw:.1f} x {sh:.1f} pt"
-                )
-            elif stamp_width_px is not None and stamp_height_px is not None:
-                # Legacy fixed pixel/point size
-                sw = float(stamp_width_px)
-                sh = float(stamp_height_px)
-                logger.info(
-                    f"Page {i+1}: Stamp fixed {sw}x{sh} pt"
-                )
-            else:
-                # Default fallback: 15% width, 10% height
-                sw = 0.15 * page_w
-                sh = 0.10 * page_h
-                logger.info(
-                    f"Page {i+1}: Stamp default 15%x10% → {sw:.1f}x{sh:.1f} pt"
-                )
+            sw, sh = _resolve_stamp_size(
+                page_w, page_h,
+                stamp_width_percent, stamp_height_percent,
+                stamp_width_px, stamp_height_px,
+            )
 
             overlay_bytes = build_stamp_overlay(
                 page_width_pt=page_w,
@@ -247,16 +253,14 @@ def stamp_pdf(
                 flip_y=flip_y,
             )
 
-            overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
-            overlay_page = overlay_reader.pages[0]
+            overlay_page = PdfReader(io.BytesIO(overlay_bytes)).pages[0]
             page.merge_page(overlay_page)
 
         writer.add_page(page)
 
     out = io.BytesIO()
     writer.write(out)
-    out.seek(0)
-    return out.read()
+    return out.getvalue()
 
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
@@ -266,16 +270,25 @@ def health():
     return jsonify({"status": "ok", "service": "PDF Stamp API"})
 
 
+@app.route("/ready", methods=["GET"])
+def ready():
+    """Readiness probe — confirms dependencies are importable."""
+    return jsonify({"status": "ready"})
+
+
 @app.route("/stamp", methods=["POST"])
 def stamp_endpoint():
     if not check_auth(request):
         return jsonify({"error": "Unauthorized. Send header: x-api-key: PDF_Stamp"}), 401
 
-    data = request.get_json(force=True)
-    if not data:
-        return jsonify({"error": "JSON body required"}), 400
+    if request.content_length and request.content_length > MAX_BODY_BYTES:
+        return jsonify({"error": f"Request body too large (limit {MAX_BODY_BYTES // (1024*1024)} MB)"}), 413
 
-    # ── Required ────────────────────────────────────────────────────────────
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "Valid JSON body required"}), 400
+
+    # ── Required fields ──────────────────────────────────────────────────────
     pdf_b64   = data.get("pdf")
     stamp_b64 = data.get("stamp")
     if not pdf_b64 or not stamp_b64:
@@ -284,34 +297,26 @@ def stamp_endpoint():
     try:
         pdf_bytes   = base64.b64decode(pdf_b64)
         stamp_bytes = base64.b64decode(stamp_b64)
-    except Exception:
+    except (ValueError, base64.binascii.Error):
         return jsonify({"error": "Invalid base64 in 'pdf' or 'stamp'"}), 400
 
-    # ── Position ────────────────────────────────────────────────────────────
-    x_percent = float(data.get("x_percent", 50))
-    y_percent = float(data.get("y_percent", 50))
+    # ── Position ─────────────────────────────────────────────────────────────
+    x_percent = _to_float(data.get("x_percent"), 50.0)
+    y_percent = _to_float(data.get("y_percent"), 50.0)
 
-    # ── Stamp size — percent (M6/N6) preferred; px as legacy fallback ───────
-    stamp_width_percent  = data.get("stamp_width_percent")   # from M6
-    stamp_height_percent = data.get("stamp_height_percent")  # from N6
-    stamp_width_px       = data.get("stamp_width")           # legacy px
-    stamp_height_px      = data.get("stamp_height")          # legacy px
+    # ── Stamp sizing (percent preferred; px as legacy fallback) ───────────────
+    stamp_width_percent  = _to_float(data.get("stamp_width_percent"))
+    stamp_height_percent = _to_float(data.get("stamp_height_percent"))
+    stamp_width_px       = _to_float(data.get("stamp_width"))
+    stamp_height_px      = _to_float(data.get("stamp_height"))
 
-    if stamp_width_percent  is not None: stamp_width_percent  = float(stamp_width_percent)
-    if stamp_height_percent is not None: stamp_height_percent = float(stamp_height_percent)
-    if stamp_width_px       is not None: stamp_width_px       = float(stamp_width_px)
-    if stamp_height_px      is not None: stamp_height_px      = float(stamp_height_px)
-
-    # ── Date text ───────────────────────────────────────────────────────────
+    # ── Date text ─────────────────────────────────────────────────────────────
     date_text      = data.get("date_text")
-    date_x_percent = data.get("date_x_percent")
-    date_y_percent = data.get("date_y_percent")
-    date_font_size = float(data.get("date_font_size", 6))
+    date_x_percent = _to_float(data.get("date_x_percent"))
+    date_y_percent = _to_float(data.get("date_y_percent"))
+    date_font_size = _to_float(data.get("date_font_size"), 6.0)
 
-    if date_x_percent is not None: date_x_percent = float(date_x_percent)
-    if date_y_percent is not None: date_y_percent = float(date_y_percent)
-
-    # ── Axis + page options ─────────────────────────────────────────────────
+    # ── Axis + page options ───────────────────────────────────────────────────
     flip_x     = bool(data.get("flip_x", False))
     flip_y     = bool(data.get("flip_y", False))
     pages      = data.get("pages", "all")
@@ -336,9 +341,9 @@ def stamp_endpoint():
             pages=pages,
             occurrence=occurrence,
         )
-    except Exception as e:
-        logger.error(f"Stamping failed: {e}")
-        return jsonify({"error": str(e)}), 500
+    except Exception as exc:
+        logger.error("Stamping failed: %s", exc, exc_info=True)
+        return jsonify({"error": str(exc)}), 500
 
     return jsonify({
         "status":      "success",
