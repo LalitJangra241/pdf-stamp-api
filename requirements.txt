@@ -1,5 +1,4 @@
-flask
-pypdf2
-pdfminer.six
-pillow
-pymupdf
+flask>=3.0.0
+pypdf>=4.0.0
+reportlab>=4.0.0
+pillow>=10.0.0
