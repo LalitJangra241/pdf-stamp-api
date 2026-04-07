@@ -1,273 +1,232 @@
 """
-PDF STAMP AUTOMATION — Python Client
-=====================================
-  - Single PDF stamping with X/Y percent coordinates
-  - Y-axis flip fix (API origin = top-left, Y increases downward)
-  - Debug mode: tests all 4 axis combinations
-  - Batch processing from CSV
-  - Optional Google Drive upload
+PDF STAMP API  — Flask
+======================
+POST /stamp
+  Stamps a PDF with an image + optional date text.
+  All positions and sizes are PERCENTAGE-based (0-100) relative to page dimensions.
+  Supports: single page, all pages, first/last occurrence.
 
-Usage:
-  python app.py --pdf input.pdf --stamp stamp.png --x 53.4 --y 9.5
-  python app.py --pdf input.pdf --stamp stamp.png --x 53.4 --y 9.5 --debug
-  python app.py --batch jobs.csv
+POST /health
+  Returns {"status": "ok"}
+
+Request JSON fields
+-------------------
+  pdf                  (str, required)  Base64-encoded PDF
+  signature            (str, required)  Base64-encoded stamp/signature image
+  x_percent            (float, required) 0-100 from LEFT edge
+  y_percent            (float, required) 0-100 from TOP edge
+
+  stamp_width          (float) fixed px width  (used if stamp_width_percent not given)
+  stamp_height         (float) fixed px height (used if stamp_height_percent not given)
+  stamp_width_percent  (float) % of page width  -- TAKES PRIORITY over stamp_width
+  stamp_height_percent (float) % of page height -- TAKES PRIORITY over stamp_height
+
+  date_text            (str)   Date string to print above stamp
+  date_x_percent       (float) X center of date text (defaults to x_percent)
+  date_y_percent       (float) Y of date text from top (defaults to y_percent - 4)
+  date_font_size       (float) Font size in pts (default 8)
+
+  occurrence           (str)   "all" | "first" | "last"  (default "all")
+  pages                (str)   "all" | "1" | "1,3,5" | "1-3" (default "all")
+  padding              (float) Extra offset in pts (default 0)
+
+  flip_x               (bool)  Mirror X axis before placing stamp (default false)
+  flip_y               (bool)  Mirror Y axis before placing stamp (default false)
+
+Response JSON
+-------------
+  {"pdf": "<base64>"}   on success
+  {"error": "<msg>"}    on failure
 """
 
-import argparse
+from flask import Flask, request, jsonify
 import base64
-import csv
-import json
-import os
-import requests
+import io
+import traceback
 
-# ── CONFIG ────────────────────────────────────────────────
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.colors import HexColor
+import PIL.Image
 
-CONFIG = {
-    "API_URL":      "https://pdf-stamp-api-tcau.onrender.com/stamp",
-    "API_KEY":      "PDF_Stamp",
-    "STAMP_WIDTH":  70,
-    "STAMP_HEIGHT": 30,
-    "OCCURRENCE":   "last",
-    "PAGES":        "all",
-    "PADDING":      6,
-    "FLIP_Y":       True,   # API origin = top-left, Y increases downward
-    "FLIP_X":       False,
-}
+app = Flask(__name__)
 
-# ── HELPERS ───────────────────────────────────────────────
+API_KEY = "PDF_Stamp"
 
-def read_file_base64(file_path: str) -> str:
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-    with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
 
-def save_pdf(base64_pdf: str, output_path: str):
-    with open(output_path, "wb") as f:
-        f.write(base64.b64decode(base64_pdf))
-    print(f"  ✅ Saved → {output_path}")
+# ── helpers ────────────────────────────────────────────────────────────────────
 
-def apply_axis_corrections(x: float, y: float, flip_x=None, flip_y=None):
-    fx = CONFIG["FLIP_X"] if flip_x is None else flip_x
-    fy = CONFIG["FLIP_Y"] if flip_y is None else flip_y
-    api_x = round((100 - x) if fx else x, 2)
-    api_y = round((100 - y) if fy else y, 2)
-    return api_x, api_y
+def check_api_key():
+    if request.headers.get("x-api-key", "") != API_KEY:
+        return jsonify({"error": "Unauthorized: invalid or missing x-api-key"}), 401
+    return None
 
-def call_stamp_api(payload: dict) -> dict:
-    try:
-        response = requests.post(
-            CONFIG["API_URL"],
-            headers={"Content-Type": "application/json", "x-api-key": CONFIG["API_KEY"]},
-            data=json.dumps(payload),
-            timeout=60,
-        )
-    except requests.exceptions.RequestException as e:
-        raise ConnectionError(f"Network error: {e}")
 
-    if response.status_code != 200:
-        raise RuntimeError(f"API HTTP {response.status_code}: {response.text[:300]}")
+def b64_decode(b64: str) -> bytes:
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    b64 += "=" * (-len(b64) % 4)
+    return base64.b64decode(b64)
 
-    result = response.json()
-    if "error" in result:
-        raise RuntimeError(f"API Error: {result['error']}")
-    return result
 
-# ── CORE STAMP ────────────────────────────────────────────
-
-def stamp_pdf(
-    pdf_path:    str,
-    stamp_path:  str,
-    x_percent:   float,
-    y_percent:   float,
-    output_path: str = "Stamped_output.pdf",
-    flip_x:      bool = None,
-    flip_y:      bool = None,
-    verbose:     bool = True,
-) -> str:
-    if not (0 <= x_percent <= 100 and 0 <= y_percent <= 100):
-        raise ValueError(f"Coordinates must be 0–100. Got x={x_percent}, y={y_percent}")
-
-    if verbose:
-        print(f"\n📄 PDF     : {pdf_path}")
-        print(f"🖼  Stamp   : {stamp_path}")
-        print(f"📍 Position: X={x_percent}%  Y={y_percent}%  (user coords)")
-
-    pdf_base64   = read_file_base64(pdf_path)
-    stamp_base64 = read_file_base64(stamp_path)
-
-    api_x, api_y = apply_axis_corrections(x_percent, y_percent, flip_x, flip_y)
-
-    if verbose:
-        print(f"🔧 API call: X={api_x}%  Y={api_y}%  "
-              f"(flip_x={CONFIG['FLIP_X'] if flip_x is None else flip_x}, "
-              f"flip_y={CONFIG['FLIP_Y'] if flip_y is None else flip_y})")
-
-    result = call_stamp_api({
-        "pdf":          pdf_base64,
-        "signature":    stamp_base64,
-        "x_percent":    api_x,
-        "y_percent":    api_y,
-        "stamp_width":  CONFIG["STAMP_WIDTH"],
-        "stamp_height": CONFIG["STAMP_HEIGHT"],
-        "occurrence":   CONFIG["OCCURRENCE"],
-        "pages":        CONFIG["PAGES"],
-        "padding":      CONFIG["PADDING"],
-    })
-
-    save_pdf(result["pdf"], output_path)
-    return output_path
-
-# ── DEBUG MODE ────────────────────────────────────────────
-
-def debug_stamp(pdf_path: str, stamp_path: str, x: float, y: float):
-    combos = [
-        (False, False, "debug_noflip.pdf",  "No flips      (FLIP_X=False, FLIP_Y=False)"),
-        (False, True,  "debug_flipY.pdf",   "Flip Y only   (FLIP_X=False, FLIP_Y=True)  ← most likely fix"),
-        (True,  False, "debug_flipX.pdf",   "Flip X only   (FLIP_X=True,  FLIP_Y=False)"),
-        (True,  True,  "debug_flipXY.pdf",  "Flip X and Y  (FLIP_X=True,  FLIP_Y=True)"),
-    ]
-
-    print(f"\n🔍 DEBUG MODE — X={x}%, Y={y}%\n")
-    pdf_base64   = read_file_base64(pdf_path)
-    stamp_base64 = read_file_base64(stamp_path)
-
-    for flip_x, flip_y, out_file, label in combos:
-        api_x, api_y = apply_axis_corrections(x, y, flip_x, flip_y)
-        print(f"  [{label}]  →  X={api_x}%, Y={api_y}%  →  {out_file}")
-        try:
-            result = call_stamp_api({
-                "pdf":          pdf_base64,
-                "signature":    stamp_base64,
-                "x_percent":    api_x,
-                "y_percent":    api_y,
-                "stamp_width":  CONFIG["STAMP_WIDTH"],
-                "stamp_height": CONFIG["STAMP_HEIGHT"],
-                "occurrence":   CONFIG["OCCURRENCE"],
-                "pages":        CONFIG["PAGES"],
-                "padding":      CONFIG["PADDING"],
-            })
-            save_pdf(result["pdf"], out_file)
-        except Exception as e:
-            print(f"    ❌ Failed: {e}")
-
-    print("\n✅ Open the 4 PDFs and find which is correct.")
-    print('   Then set "FLIP_X" and "FLIP_Y" in CONFIG.\n')
-
-# ── BATCH ─────────────────────────────────────────────────
-
-def batch_stamp(csv_path: str):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
-
-    print(f"\n📋 Batch mode — {csv_path}\n")
-    success = failed = 0
-
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    print(f"  Found {len(rows)} job(s)\n")
-
-    for i, row in enumerate(rows, 1):
-        try:
-            pdf_path    = row["pdf_path"].strip()
-            stamp_path  = row["stamp_path"].strip()
-            x_percent   = float(row["x_percent"])
-            y_percent   = float(row["y_percent"])
-            output_path = row.get("output_path", "").strip() or f"Stamped_{os.path.basename(pdf_path)}"
-
-            out_dir = os.path.dirname(output_path)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-
-            print(f"  Job {i}/{len(rows)}: {pdf_path}")
-            stamp_pdf(pdf_path, stamp_path, x_percent, y_percent, output_path)
-            success += 1
-        except Exception as e:
-            print(f"  ❌ Job {i} failed: {e}")
-            failed += 1
-
-    print(f"\n{'='*40}")
-    print(f"  Done: {success} succeeded, {failed} failed")
-    print(f"{'='*40}\n")
-
-# ── GOOGLE DRIVE UPLOAD ───────────────────────────────────
-
-def upload_to_drive(file_path: str, folder_id: str) -> str:
-    try:
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from google.auth.transport.requests import Request
-    except ImportError:
-        raise ImportError("Run: pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
-
-    SCOPES     = ["https://www.googleapis.com/auth/drive.file"]
-    creds      = None
-    token_file = "token.json"
-
-    if os.path.exists(token_file):
-        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+def parse_pages(pages_str: str, total: int) -> list:
+    s = str(pages_str).strip().lower()
+    if s == "all":
+        return list(range(total))
+    indices = set()
+    for part in s.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            indices.update(range(int(a) - 1, int(b)))
         else:
-            if not os.path.exists("credentials.json"):
-                raise FileNotFoundError("credentials.json not found.")
-            flow  = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_file, "w") as token:
-            token.write(creds.to_json())
+            indices.add(int(part) - 1)
+    return sorted(i for i in indices if 0 <= i < total)
 
-    service  = build("drive", "v3", credentials=creds)
-    media    = MediaFileUpload(file_path, mimetype="application/pdf")
-    uploaded = service.files().create(
-        body={"name": os.path.basename(file_path), "parents": [folder_id]},
-        media_body=media, fields="id,webViewLink"
-    ).execute()
-    url = uploaded.get("webViewLink", "")
-    print(f"  ☁️  Uploaded → {url}")
-    return url
 
-# ── CLI ───────────────────────────────────────────────────
+def resolve_occurrence(indices: list, occurrence: str) -> list:
+    occ = str(occurrence).strip().lower()
+    if occ == "first":
+        return indices[:1]
+    if occ == "last":
+        return indices[-1:]
+    return indices
 
-def main():
-    parser = argparse.ArgumentParser(description="PDF Stamp — apply image at X/Y% position")
-    parser.add_argument("--pdf",          help="Input PDF path")
-    parser.add_argument("--stamp",        help="Stamp image path (PNG/JPG)")
-    parser.add_argument("--x",  type=float, help="X position 0–100 (0=left, 100=right)")
-    parser.add_argument("--y",  type=float, help="Y position 0–100 (0=bottom, 100=top)")
-    parser.add_argument("--output",       help="Output PDF path")
-    parser.add_argument("--debug",        action="store_true", help="Generate 4 test PDFs for axis-flip combos")
-    parser.add_argument("--batch",        metavar="CSV",       help="Batch mode: path to CSV")
-    parser.add_argument("--drive-folder", metavar="FOLDER_ID", help="Upload result to Google Drive folder")
-    parser.add_argument("--flip-x",       action="store_true", help="Force flip X axis")
-    parser.add_argument("--flip-y",       action="store_true", help="Force flip Y axis")
-    parser.add_argument("--no-flip-y",    action="store_true", help="Disable Y flip")
-    args = parser.parse_args()
 
-    if args.flip_x:   CONFIG["FLIP_X"] = True
-    if args.flip_y:   CONFIG["FLIP_Y"] = True
-    if args.no_flip_y: CONFIG["FLIP_Y"] = False
+def make_overlay(pw, ph, stamp_bytes,
+                 x_pt, y_pt, sw_pt, sh_pt,
+                 date_text, date_x_pt, date_y_pt, font_sz) -> bytes:
+    """
+    Build a transparent PDF page overlay (ReportLab origin = bottom-left).
+    All y values are already converted from top-origin before this call.
+    """
+    buf = io.BytesIO()
+    c   = canvas.Canvas(buf, pagesize=(pw, ph))
 
-    if args.batch:
-        batch_stamp(args.batch)
-        return
+    if date_text:
+        c.setFont("Helvetica-Bold", font_sz)
+        c.setFillColor(HexColor("#000000"))
+        c.drawCentredString(date_x_pt, date_y_pt, date_text)
 
-    if not all([args.pdf, args.stamp, args.x is not None, args.y is not None]):
-        parser.error("--pdf, --stamp, --x, and --y are required.")
+    img        = PIL.Image.open(io.BytesIO(stamp_bytes)).convert("RGBA")
+    img_reader = ImageReader(img)
+    c.drawImage(img_reader, x_pt, y_pt,
+                width=sw_pt, height=sh_pt,
+                mask="auto", preserveAspectRatio=False)
 
-    if args.debug:
-        debug_stamp(args.pdf, args.stamp, args.x, args.y)
-        return
+    c.save()
+    buf.seek(0)
+    return buf.read()
 
-    output   = args.output or f"Stamped_{os.path.basename(args.pdf)}"
-    out_path = stamp_pdf(args.pdf, args.stamp, args.x, args.y, output)
 
-    if args.drive_folder:
-        upload_to_drive(out_path, args.drive_folder)
+# ── routes ─────────────────────────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/stamp", methods=["POST"])
+def stamp():
+    err = check_api_key()
+    if err:
+        return err
+
+    try:
+        body = request.get_json(force=True)
+
+        # required
+        for f in ["pdf", "signature", "x_percent", "y_percent"]:
+            if f not in body:
+                return jsonify({"error": f"Missing required field: '{f}'"}), 400
+
+        pdf_bytes   = b64_decode(body["pdf"])
+        stamp_bytes = b64_decode(body["signature"])
+
+        x_pct = float(body["x_percent"])
+        y_pct = float(body["y_percent"])
+
+        # optional axis flips
+        if body.get("flip_x", False):
+            x_pct = 100 - x_pct
+        if body.get("flip_y", False):
+            y_pct = 100 - y_pct
+
+        # stamp size — percent keys take priority over fixed-px keys
+        sw_pct = float(body["stamp_width_percent"])  if "stamp_width_percent"  in body else None
+        sh_pct = float(body["stamp_height_percent"]) if "stamp_height_percent" in body else None
+        sw_px  = float(body.get("stamp_width",  70)) if sw_pct is None else None
+        sh_px  = float(body.get("stamp_height", 30)) if sh_pct is None else None
+
+        # date / text options
+        date_text  = str(body.get("date_text",    ""))
+        date_x_pct = float(body.get("date_x_percent", x_pct))
+        date_y_pct = float(body.get("date_y_percent", max(y_pct - 4, 0)))
+        font_size  = float(body.get("date_font_size", 8))
+        padding    = float(body.get("padding", 0))
+
+        # page selection
+        occurrence  = str(body.get("occurrence", "all"))
+        pages_param = str(body.get("pages",      "all"))
+
+        # validate
+        for name, val in [("x_percent", x_pct), ("y_percent", y_pct)]:
+            if not (0 <= val <= 100):
+                return jsonify({"error": f"{name} must be 0-100, got {val}"}), 400
+        if sw_pct is not None and not (0 < sw_pct <= 100):
+            return jsonify({"error": f"stamp_width_percent must be 0-100, got {sw_pct}"}), 400
+        if sh_pct is not None and not (0 < sh_pct <= 100):
+            return jsonify({"error": f"stamp_height_percent must be 0-100, got {sh_pct}"}), 400
+
+        # process PDF
+        reader      = PdfReader(io.BytesIO(pdf_bytes))
+        writer      = PdfWriter()
+        total_pages = len(reader.pages)
+
+        stamp_set = set(resolve_occurrence(
+            parse_pages(pages_param, total_pages), occurrence
+        ))
+
+        for idx, page in enumerate(reader.pages):
+            if idx in stamp_set:
+                box = page.mediabox
+                pw  = float(box.width)
+                ph  = float(box.height)
+
+                # resolve stamp size in pts
+                sw_pt = (pw * sw_pct / 100) if sw_pct is not None else sw_px
+                sh_pt = (ph * sh_pct / 100) if sh_pct is not None else sh_px
+
+                # convert % positions → pts
+                # x: left-origin (same as ReportLab)
+                # y: top-origin input → flip to ReportLab bottom-origin
+                x_pt = pw * x_pct / 100 + padding
+                y_pt = ph * (1 - y_pct / 100) - sh_pt - padding
+
+                date_x_pt = pw * date_x_pct / 100
+                date_y_pt = ph * (1 - date_y_pct / 100)
+
+                overlay = make_overlay(
+                    pw, ph, stamp_bytes,
+                    x_pt, y_pt, sw_pt, sh_pt,
+                    date_text, date_x_pt, date_y_pt, font_size,
+                )
+                page.merge_page(PdfReader(io.BytesIO(overlay)).pages[0])
+
+            writer.add_page(page)
+
+        out = io.BytesIO()
+        writer.write(out)
+        out.seek(0)
+
+        return jsonify({"pdf": base64.b64encode(out.read()).decode()}), 200
+
+    except Exception:
+        return jsonify({"error": traceback.format_exc()}), 500
+
+
+# ── entry ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=8000, debug=False)
