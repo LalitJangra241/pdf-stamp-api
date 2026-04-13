@@ -16,6 +16,19 @@ All values (position + size) are PERCENTAGES (%) of page dimensions.
 
   Font size also auto-scales with page height.
 
+Sheet column mapping (row 12):
+  A = Name
+  B = Role / dept
+  C = Doer Sign Stamp URL       → stamp image
+  D = Doer Sign Stamp X %       → x_percent
+  E = Doer Sign Stamp Y %       → y_percent
+  F = Timestamp text            → date_text
+  G = Timestamp X %             → date_x_percent
+  H = Timestamp Y %             → date_y_percent
+  I = STAMP_WIDTH %             → stamp_width_percent
+  J = STAMP_HEIGHT %            → stamp_height_percent
+  K = Timestamp_FONT_SIZE (pt)  → date_font_size  (A4 base, auto-scales)
+
 Endpoints:
   GET  /health  → health check / server wake
   POST /stamp   → stamp PDF, returns base64 PDF
@@ -130,7 +143,6 @@ def resolve_stamp_size(page_w, page_h, stamp_width_percent, stamp_height_percent
                 f"Got: W={sw}% H={sh}%"
             )
 
-        # Log actual pt size for easy debugging
         sw_pt = (sw / 100.0) * page_w
         sh_pt = (sh / 100.0) * page_h
         logger.info(
@@ -142,7 +154,6 @@ def resolve_stamp_size(page_w, page_h, stamp_width_percent, stamp_height_percent
         )
         return sw, sh
 
-    # Fallback
     logger.warning(
         "stamp_width/height_percent missing — fallback %.1f%%×%.1f%%",
         DEFAULT_SIZE_PCT, DEFAULT_SIZE_PCT
@@ -164,7 +175,7 @@ def build_stamp_overlay(page_w, page_h, stamp_img_bytes,
     """
     Render stamp image + optional timestamp onto a transparent PDF layer.
 
-    All inputs use TOP-LEFT origin (same as Google Sheet).
+    All inputs use TOP-LEFT origin (same as Google Sheet coordinates).
     ReportLab uses BOTTOM-LEFT origin — converted internally.
     Font size is auto-scaled proportionally to the page height.
     """
@@ -211,7 +222,7 @@ def build_stamp_overlay(page_w, page_h, stamp_img_bytes,
         scaled_font = date_font_size * (page_h / A4_HEIGHT_PT)
 
         date_x = (page_w - raw_dx) if flip_x else raw_dx
-        # Place text just above stamp top edge (+2pt gap)
+        # Place text baseline just above the stamp top edge (+2pt gap)
         date_y = (raw_dy + sh + 2) if flip_y else (page_h - raw_dy + 2)
 
         logger.info(
@@ -243,8 +254,7 @@ def stamp_pdf(pdf_bytes, stamp_bytes,
     """
     Apply stamp to selected pages.
     Page size is read per-page from the actual PDF, so mixed-size
-    PDFs are handled correctly. Rows are chained: each call receives
-    the stamped PDF output of the previous row as input.
+    PDFs are handled correctly.
     """
     reader       = PdfReader(io.BytesIO(pdf_bytes))
     writer       = PdfWriter()
@@ -349,8 +359,8 @@ def stamp_endpoint():
 
     if not pdf_b64:         return jsonify({"error": "Missing: pdf"}), 400
     if not stamp_b64:       return jsonify({"error": "Missing: stamp"}), 400
-    if x_pct       is None: return jsonify({"error": "Missing: x_percent"}), 400
-    if y_pct       is None: return jsonify({"error": "Missing: y_percent"}), 400
+    if x_pct       is None: return jsonify({"error": "Missing: x_percent (col D)"}), 400
+    if y_pct       is None: return jsonify({"error": "Missing: y_percent (col E)"}), 400
     if stamp_w_pct is None: return jsonify({"error": "Missing: stamp_width_percent (col I)"}), 400
     if stamp_h_pct is None: return jsonify({"error": "Missing: stamp_height_percent (col J)"}), 400
 
@@ -366,7 +376,7 @@ def stamp_endpoint():
     font_size  = _to_float(data.get("date_font_size"), 6.0)
 
     if date_text and (font_size is None or font_size <= 0):
-        return jsonify({"error": f"date_font_size must be > 0 when date_text is set, got {font_size}"}), 400
+        return jsonify({"error": f"date_font_size must be > 0 when date_text is set. Got: {font_size}"}), 400
 
     # ── Other options ─────────────────────────────────────
     pages      = data.get("pages", "all")
@@ -376,8 +386,8 @@ def stamp_endpoint():
 
     logger.info("=" * 60)
     logger.info("INCOMING /stamp")
-    logger.info("  x_percent            = %s", x_pct)
-    logger.info("  y_percent            = %s", y_pct)
+    logger.info("  x_percent            = %s  (col D)", x_pct)
+    logger.info("  y_percent            = %s  (col E)", y_pct)
     logger.info("  stamp_width_percent  = %s  (col I)", stamp_w_pct)
     logger.info("  stamp_height_percent = %s  (col J)", stamp_h_pct)
     logger.info("  date_text            = %s  (col F)", date_text)
