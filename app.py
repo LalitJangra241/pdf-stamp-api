@@ -84,35 +84,26 @@ def filter_occurrence(page_indices: list, occurrence: str) -> list:
 
 
 def _resolve_stamp_size(page_w, page_h,
-                         stamp_width_percent, stamp_height_percent,
-                         stamp_width_px, stamp_height_px):
+                        stamp_width_percent, stamp_height_percent,
+                        stamp_width_px, stamp_height_px):
     """
     stamp_width_percent  → % of page WIDTH
     stamp_height_percent → % of page HEIGHT
-
-    Example: page = 841 x 595 pt (A4 landscape)
-             width%=40, height%=10
-             → stamp = 336.4 x 59.5 pt
     """
     if stamp_width_percent is not None and stamp_height_percent is not None:
         sw = (stamp_width_percent  / 100.0) * page_w
         sh = (stamp_height_percent / 100.0) * page_h
         logger.info(
-            "Stamp size (percent): "
-            "width=%.2f%% of page_w(%.2fpt) → %.2fpt | "
-            "height=%.2f%% of page_h(%.2fpt) → %.2fpt",
-            stamp_width_percent, page_w, sw,
-            stamp_height_percent, page_h, sh,
+            "Stamp size (percent): width=%.2f%% → %.2fpt | height=%.2f%% → %.2fpt",
+            stamp_width_percent, sw, stamp_height_percent, sh,
         )
     elif stamp_width_px is not None and stamp_height_px is not None:
         sw, sh = float(stamp_width_px), float(stamp_height_px)
         logger.info("Stamp size (fixed px): %.2f x %.2f pt", sw, sh)
     else:
-        # Default: 15% wide, 10% tall
         sw = 0.15 * page_w
         sh = 0.10 * page_h
         logger.info("Stamp size (default 15%%x10%%): %.2f x %.2f pt", sw, sh)
-
     return sw, sh
 
 
@@ -126,30 +117,23 @@ def build_stamp_overlay(
     """
     Coordinate system:
       x_percent / y_percent = TOP-LEFT corner of stamp as % of page.
-      ReportLab origin = BOTTOM-LEFT.
-      Conversion: rl_x = raw_x
-                  rl_y = page_height - raw_y - stamp_height
+      ReportLab origin      = BOTTOM-LEFT.
+      Conversion:
+        rl_x = raw_x
+        rl_y = page_height - raw_y - stamp_height
     """
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_width_pt, page_height_pt))
 
-    # ── Stamp position ────────────────────────────────────────
+    # ── Stamp position ─────────────────────────────────────
     raw_x = (x_percent / 100.0) * page_width_pt
     raw_y = (y_percent / 100.0) * page_height_pt
 
-    if flip_x:
-        stamp_x = page_width_pt - raw_x - stamp_width_pt
-    else:
-        stamp_x = raw_x
-
-    if flip_y:
-        stamp_y = raw_y
-    else:
-        # Convert from "top-left origin" to ReportLab "bottom-left origin"
-        stamp_y = page_height_pt - raw_y - stamp_height_pt
+    stamp_x = (page_width_pt - raw_x - stamp_width_pt) if flip_x else raw_x
+    stamp_y = raw_y if flip_y else (page_height_pt - raw_y - stamp_height_pt)
 
     logger.info(
-        "Stamp draw → page=(%.2f x %.2f)pt | size=(%.2f x %.2f)pt | "
+        "Stamp → page=(%.2f x %.2f)pt | size=(%.2f x %.2f)pt | "
         "input(x=%.2f%%, y=%.2f%%) → raw(%.2f, %.2f)pt → rl(%.2f, %.2f)pt",
         page_width_pt, page_height_pt,
         stamp_width_pt, stamp_height_pt,
@@ -173,7 +157,7 @@ def build_stamp_overlay(
         logger.error("Failed to draw stamp image: %s", exc)
         raise
 
-    # ── Date / timestamp ──────────────────────────────────────
+    # ── Date / timestamp ───────────────────────────────────
     if date_text:
         dx_pct = date_x_percent if date_x_percent is not None else x_percent
         dy_pct = date_y_percent if date_y_percent is not None else y_percent
@@ -181,25 +165,13 @@ def build_stamp_overlay(
         raw_dx = (dx_pct / 100.0) * page_width_pt
         raw_dy = (dy_pct / 100.0) * page_height_pt
 
-        if flip_x:
-            date_x = page_width_pt - raw_dx
-        else:
-            date_x = raw_dx
-
-        if flip_y:
-            date_y = raw_dy + stamp_height_pt + 2
-        else:
-            # Date sits just ABOVE the stamp top edge in the PDF
-            # stamp top (RL) = stamp_y + stamp_height_pt
-            # date is placed at its own y_percent coordinate
-            date_y = page_height_pt - raw_dy + 2
+        date_x = (page_width_pt - raw_dx)          if flip_x else raw_dx
+        date_y = (raw_dy + stamp_height_pt + 2)    if flip_y else (page_height_pt - raw_dy + 2)
 
         logger.info(
-            "Date draw → text='%s' font=%.1fpt | "
+            "Date → text='%s' font=%.1fpt | "
             "input(dx=%.2f%%, dy=%.2f%%) → rl(%.2f, %.2f)pt",
-            date_text, date_font_size,
-            dx_pct, dy_pct,
-            date_x, date_y,
+            date_text, date_font_size, dx_pct, dy_pct, date_x, date_y,
         )
 
         c.setFont("Helvetica", date_font_size)
@@ -215,4 +187,156 @@ def stamp_pdf(
     stamp_width_percent=None, stamp_height_percent=None,
     stamp_width_px=None, stamp_height_px=None,
     date_text=None, date_x_percent=None, date_y_percent=None,
-    d
+    date_font_size=6, pages="all", occurrence="all",
+    flip_x=False, flip_y=False,
+) -> bytes:
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    total  = len(reader.pages)
+
+    page_indices = parse_pages(pages, total)
+    page_indices = filter_occurrence(page_indices, occurrence)
+    stamp_set    = set(page_indices)
+
+    for idx in range(total):
+        page   = reader.pages[idx]
+        page_w = float(page.mediabox.width)
+        page_h = float(page.mediabox.height)
+
+        if idx in stamp_set:
+            sw, sh = _resolve_stamp_size(
+                page_w, page_h,
+                stamp_width_percent, stamp_height_percent,
+                stamp_width_px, stamp_height_px,
+            )
+            overlay_bytes = build_stamp_overlay(
+                page_w, page_h, stamp_bytes,
+                x_percent, y_percent, sw, sh,
+                date_text=date_text,
+                date_x_percent=date_x_percent,
+                date_y_percent=date_y_percent,
+                date_font_size=date_font_size,
+                flip_x=flip_x,
+                flip_y=flip_y,
+            )
+            overlay_page = PdfReader(io.BytesIO(overlay_bytes)).pages[0]
+            page.merge_page(overlay_page)
+
+        writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+# ── ROUTES ────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/stamp", methods=["POST"])
+def stamp_endpoint():
+
+    # ── Auth ───────────────────────────────────────────────
+    if not check_auth(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # ── Size guard ─────────────────────────────────────────
+    content_length = request.content_length
+    if content_length and content_length > MAX_BODY_BYTES:
+        return jsonify({"error": "Request too large (max 50 MB)"}), 413
+
+    # ── Parse JSON ─────────────────────────────────────────
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    if not data:
+        return jsonify({"error": "Empty request body"}), 400
+
+    # ── Required fields ────────────────────────────────────
+    pdf_b64   = data.get("pdf")
+    stamp_b64 = data.get("stamp")
+    x_pct     = _to_float(data.get("x_percent"))
+    y_pct     = _to_float(data.get("y_percent"))
+
+    if not pdf_b64:
+        return jsonify({"error": "Missing: pdf (base64)"}), 400
+    if not stamp_b64:
+        return jsonify({"error": "Missing: stamp (base64)"}), 400
+    if x_pct is None:
+        return jsonify({"error": "Missing: x_percent"}), 400
+    if y_pct is None:
+        return jsonify({"error": "Missing: y_percent"}), 400
+
+    # ── Optional fields ────────────────────────────────────
+    stamp_width_percent  = _to_float(data.get("stamp_width_percent"))
+    stamp_height_percent = _to_float(data.get("stamp_height_percent"))
+    stamp_width_px       = _to_float(data.get("stamp_width_px"))
+    stamp_height_px      = _to_float(data.get("stamp_height_px"))
+    date_text            = data.get("date_text")
+    date_x_percent       = _to_float(data.get("date_x_percent"))
+    date_y_percent       = _to_float(data.get("date_y_percent"))
+    date_font_size       = _to_float(data.get("date_font_size"), default=6)
+    pages                = data.get("pages", "all")
+    occurrence           = data.get("occurrence", "all")
+    flip_x               = bool(data.get("flip_x", False))
+    flip_y               = bool(data.get("flip_y", False))
+
+    # ── Decode base64 ──────────────────────────────────────
+    try:
+        pdf_bytes   = base64.b64decode(pdf_b64)
+        stamp_bytes = base64.b64decode(stamp_b64)
+    except Exception as e:
+        return jsonify({"error": "Base64 decode failed: " + str(e)}), 400
+
+    logger.info(
+        "Request → x=%.2f%% y=%.2f%% | w%%=%.2f h%%=%.2f | "
+        "date='%s' pages='%s' occurrence='%s' flip_x=%s flip_y=%s",
+        x_pct, y_pct,
+        stamp_width_percent  or 0,
+        stamp_height_percent or 0,
+        date_text or "", pages, occurrence, flip_x, flip_y,
+    )
+
+    # ── Process ────────────────────────────────────────────
+    try:
+        result_bytes = stamp_pdf(
+            pdf_bytes, stamp_bytes,
+            x_pct, y_pct,
+            stamp_width_percent  = stamp_width_percent,
+            stamp_height_percent = stamp_height_percent,
+            stamp_width_px       = stamp_width_px,
+            stamp_height_px      = stamp_height_px,
+            date_text            = date_text,
+            date_x_percent       = date_x_percent,
+            date_y_percent       = date_y_percent,
+            date_font_size       = date_font_size,
+            pages                = pages,
+            occurrence           = occurrence,
+            flip_x               = flip_x,
+            flip_y               = flip_y,
+        )
+    except Exception as e:
+        logger.exception("stamp_pdf failed")
+        return jsonify({"error": str(e)}), 500
+
+    # ── Encode and return ──────────────────────────────────
+    result_b64 = base64.b64encode(result_bytes).decode("utf-8")
+    logger.info("Done → output b64 len: %d", len(result_b64))
+
+    return jsonify({
+        "pdf":         result_b64,
+        "stamped_pdf": result_b64,
+    }), 200
+
+
+# ── ENTRY POINT ───────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
