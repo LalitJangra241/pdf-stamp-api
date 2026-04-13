@@ -91,12 +91,23 @@ def _resolve_stamp_size(page_w, page_h,
     stamp_height_percent → % of page HEIGHT
     """
     if stamp_width_percent is not None and stamp_height_percent is not None:
-        sw = (stamp_width_percent  / 100.0) * page_w
-        sh = (stamp_height_percent / 100.0) * page_h
+        sw = (stamp_width_percent  / 100.0) * page_w   # % of page WIDTH
+        sh = (stamp_height_percent / 100.0) * page_h   # % of page HEIGHT
         logger.info(
-            "Stamp size (percent): width=%.2f%% → %.2fpt | height=%.2f%% → %.2fpt",
-            stamp_width_percent, sw, stamp_height_percent, sh,
+            "Stamp size (percent) → "
+            "w=%.2f%% of page_w(%.2fpt)=%.2fpt | "
+            "h=%.2f%% of page_h(%.2fpt)=%.2fpt",
+            stamp_width_percent,  page_w, sw,
+            stamp_height_percent, page_h, sh,
         )
+        if sw <= 0 or sh <= 0:
+            raise ValueError(
+                "Resolved stamp size is zero or negative: "
+                "sw={}, sh={}. Check stamp_width_percent={}, "
+                "stamp_height_percent={}".format(
+                    sw, sh, stamp_width_percent, stamp_height_percent
+                )
+            )
     elif stamp_width_px is not None and stamp_height_px is not None:
         sw, sh = float(stamp_width_px), float(stamp_height_px)
         logger.info("Stamp size (fixed px): %.2f x %.2f pt", sw, sh)
@@ -104,6 +115,7 @@ def _resolve_stamp_size(page_w, page_h,
         sw = 0.15 * page_w
         sh = 0.10 * page_h
         logger.info("Stamp size (default 15%%x10%%): %.2f x %.2f pt", sw, sh)
+
     return sw, sh
 
 
@@ -133,7 +145,8 @@ def build_stamp_overlay(
     stamp_y = raw_y if flip_y else (page_height_pt - raw_y - stamp_height_pt)
 
     logger.info(
-        "Stamp → page=(%.2f x %.2f)pt | size=(%.2f x %.2f)pt | "
+        "Stamp draw → page=(%.2fpt x %.2fpt) | "
+        "size=(%.2fpt x %.2fpt) | "
         "input(x=%.2f%%, y=%.2f%%) → raw(%.2f, %.2f)pt → rl(%.2f, %.2f)pt",
         page_width_pt, page_height_pt,
         stamp_width_pt, stamp_height_pt,
@@ -165,13 +178,15 @@ def build_stamp_overlay(
         raw_dx = (dx_pct / 100.0) * page_width_pt
         raw_dy = (dy_pct / 100.0) * page_height_pt
 
-        date_x = (page_width_pt - raw_dx)          if flip_x else raw_dx
-        date_y = (raw_dy + stamp_height_pt + 2)    if flip_y else (page_height_pt - raw_dy + 2)
+        date_x = (page_width_pt - raw_dx)       if flip_x else raw_dx
+        date_y = (raw_dy + stamp_height_pt + 2) if flip_y else (page_height_pt - raw_dy + 2)
 
         logger.info(
-            "Date → text='%s' font=%.1fpt | "
+            "Date draw → text='%s' font=%.1fpt | "
             "input(dx=%.2f%%, dy=%.2f%%) → rl(%.2f, %.2f)pt",
-            date_text, date_font_size, dx_pct, dy_pct, date_x, date_y,
+            date_text, date_font_size,
+            dx_pct, dy_pct,
+            date_x, date_y,
         )
 
         c.setFont("Helvetica", date_font_size)
@@ -287,21 +302,26 @@ def stamp_endpoint():
     flip_x               = bool(data.get("flip_x", False))
     flip_y               = bool(data.get("flip_y", False))
 
+    # ── DEBUG: log all incoming size params ────────────────
+    logger.info(
+        "INCOMING → x=%.2f%% y=%.2f%% | "
+        "stamp_width_percent=%s stamp_height_percent=%s | "
+        "stamp_width_px=%s stamp_height_px=%s | "
+        "date='%s' date_x=%s date_y=%s font=%s | "
+        "pages='%s' occurrence='%s' flip_x=%s flip_y=%s",
+        x_pct, y_pct,
+        stamp_width_percent, stamp_height_percent,
+        stamp_width_px, stamp_height_px,
+        date_text or "", date_x_percent, date_y_percent, date_font_size,
+        pages, occurrence, flip_x, flip_y,
+    )
+
     # ── Decode base64 ──────────────────────────────────────
     try:
         pdf_bytes   = base64.b64decode(pdf_b64)
         stamp_bytes = base64.b64decode(stamp_b64)
     except Exception as e:
         return jsonify({"error": "Base64 decode failed: " + str(e)}), 400
-
-    logger.info(
-        "Request → x=%.2f%% y=%.2f%% | w%%=%.2f h%%=%.2f | "
-        "date='%s' pages='%s' occurrence='%s' flip_x=%s flip_y=%s",
-        x_pct, y_pct,
-        stamp_width_percent  or 0,
-        stamp_height_percent or 0,
-        date_text or "", pages, occurrence, flip_x, flip_y,
-    )
 
     # ── Process ────────────────────────────────────────────
     try:
