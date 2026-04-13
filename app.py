@@ -13,6 +13,7 @@ Features:
 - Optional date text above the stamp
 - flip_x / flip_y axis correction support
 - Request size guard (50 MB limit)
+- Response key: "pdf" (also aliased as "stamped_pdf" for backwards compat)
 """
 
 import os
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-API_KEY        = os.environ.get("PDF_STAMP_API_KEY", "PDF_Stamp")
+API_KEY        = os.environ.get("PDF_STAMP_API_KEY", "pdf-stamp-api")
 MAX_BODY_BYTES = 50 * 1024 * 1024
 
 
@@ -86,7 +87,8 @@ def _resolve_stamp_size(page_w, page_h, stamp_width_percent, stamp_height_percen
     if stamp_width_percent is not None and stamp_height_percent is not None:
         sw = (stamp_width_percent / 100.0) * page_w
         sh = (stamp_height_percent / 100.0) * page_h
-        logger.info("Stamp size (percent): %.0f%%w x %.0f%%h → %.1f x %.1f pt", stamp_width_percent, stamp_height_percent, sw, sh)
+        logger.info("Stamp size (percent): %.0f%%w x %.0f%%h → %.1f x %.1f pt",
+                    stamp_width_percent, stamp_height_percent, sw, sh)
     elif stamp_width_px is not None and stamp_height_px is not None:
         sw, sh = float(stamp_width_px), float(stamp_height_px)
         logger.info("Stamp size (fixed px): %.1f x %.1f pt", sw, sh)
@@ -205,7 +207,7 @@ def ready():
 def stamp_endpoint():
     # ── Auth ──────────────────────────────────────────────
     if not check_auth(request):
-        return jsonify({"error": "Unauthorized. Send header: x-api-key: PDF_Stamp"}), 401
+        return jsonify({"error": "Unauthorized. Send header: x-api-key: " + API_KEY}), 401
 
     # ── Size guard ────────────────────────────────────────
     if request.content_length and request.content_length > MAX_BODY_BYTES:
@@ -268,9 +270,13 @@ def stamp_endpoint():
         logger.error("Stamping failed: %s", exc, exc_info=True)
         return jsonify({"error": str(exc)}), 500
 
+    encoded = base64.b64encode(result_bytes).decode("utf-8")
+
+    # Return BOTH keys so old and new clients work
     return jsonify({
         "status":      "success",
-        "stamped_pdf": base64.b64encode(result_bytes).decode("utf-8"),
+        "pdf":         encoded,   # ← new primary key
+        "stamped_pdf": encoded,   # ← backwards compat alias
     })
 
 
