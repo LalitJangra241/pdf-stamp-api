@@ -6,7 +6,7 @@ PDF STAMP API — Flask Server
     stamp_height_percent = % of page HEIGHT
 - Stamp POSITION as percent of page dimensions:
     x_percent = % of page WIDTH  (left edge of stamp)
-    y_percent = % of page HEIGHT (top edge of stamp, converts to ReportLab bottom-left)
+    y_percent = % of page HEIGHT (top edge of stamp)
 - API key authentication via x-api-key header
 - Page selection: "all", "1", "1-3", "1,3,5"
 - Occurrence selection: "all", "first", "last"
@@ -89,33 +89,34 @@ def _resolve_stamp_size(page_w, page_h,
     """
     stamp_width_percent  → % of page WIDTH
     stamp_height_percent → % of page HEIGHT
+    These are passed PER ROW from the sheet so must differ per call.
     """
     if stamp_width_percent is not None and stamp_height_percent is not None:
-        sw = (stamp_width_percent  / 100.0) * page_w   # % of page WIDTH
-        sh = (stamp_height_percent / 100.0) * page_h   # % of page HEIGHT
+        sw = (stamp_width_percent  / 100.0) * page_w
+        sh = (stamp_height_percent / 100.0) * page_h
         logger.info(
-            "Stamp size (percent) → "
-            "w=%.2f%% of page_w(%.2fpt)=%.2fpt | "
-            "h=%.2f%% of page_h(%.2fpt)=%.2fpt",
+            "✅ Stamp size (percent) → "
+            "w_pct=%.4f page_w=%.2fpt → sw=%.4fpt | "
+            "h_pct=%.4f page_h=%.2fpt → sh=%.4fpt",
             stamp_width_percent,  page_w, sw,
             stamp_height_percent, page_h, sh,
         )
         if sw <= 0 or sh <= 0:
             raise ValueError(
-                "Resolved stamp size is zero or negative: "
-                "sw={}, sh={}. Check stamp_width_percent={}, "
-                "stamp_height_percent={}".format(
-                    sw, sh, stamp_width_percent, stamp_height_percent
-                )
+                "Stamp size zero/negative: sw={} sh={} "
+                "(w%={} h%={})".format(sw, sh, stamp_width_percent, stamp_height_percent)
             )
-    elif stamp_width_px is not None and stamp_height_px is not None:
-        sw, sh = float(stamp_width_px), float(stamp_height_px)
-        logger.info("Stamp size (fixed px): %.2f x %.2f pt", sw, sh)
-    else:
-        sw = 0.15 * page_w
-        sh = 0.10 * page_h
-        logger.info("Stamp size (default 15%%x10%%): %.2f x %.2f pt", sw, sh)
+        return sw, sh
 
+    if stamp_width_px is not None and stamp_height_px is not None:
+        sw, sh = float(stamp_width_px), float(stamp_height_px)
+        logger.info("✅ Stamp size (fixed px) → sw=%.2fpt sh=%.2fpt", sw, sh)
+        return sw, sh
+
+    # Fallback default
+    sw = 0.15 * page_w
+    sh = 0.10 * page_h
+    logger.info("⚠️  Stamp size (default 15%%x10%%) → sw=%.2fpt sh=%.2fpt", sw, sh)
     return sw, sh
 
 
@@ -126,14 +127,7 @@ def build_stamp_overlay(
     date_text=None, date_x_percent=None, date_y_percent=None,
     date_font_size=6, flip_x=False, flip_y=False,
 ) -> bytes:
-    """
-    Coordinate system:
-      x_percent / y_percent = TOP-LEFT corner of stamp as % of page.
-      ReportLab origin      = BOTTOM-LEFT.
-      Conversion:
-        rl_x = raw_x
-        rl_y = page_height - raw_y - stamp_height
-    """
+
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_width_pt, page_height_pt))
 
@@ -145,8 +139,8 @@ def build_stamp_overlay(
     stamp_y = raw_y if flip_y else (page_height_pt - raw_y - stamp_height_pt)
 
     logger.info(
-        "Stamp draw → page=(%.2fpt x %.2fpt) | "
-        "size=(%.2fpt x %.2fpt) | "
+        "📍 Stamp draw → "
+        "page=(%.2f x %.2f)pt | size=(%.2f x %.2f)pt | "
         "input(x=%.2f%%, y=%.2f%%) → raw(%.2f, %.2f)pt → rl(%.2f, %.2f)pt",
         page_width_pt, page_height_pt,
         stamp_width_pt, stamp_height_pt,
@@ -167,7 +161,7 @@ def build_stamp_overlay(
                 mask="auto",
             )
     except Exception as exc:
-        logger.error("Failed to draw stamp image: %s", exc)
+        logger.error("❌ Failed to draw stamp image: %s", exc)
         raise
 
     # ── Date / timestamp ───────────────────────────────────
@@ -182,7 +176,7 @@ def build_stamp_overlay(
         date_y = (raw_dy + stamp_height_pt + 2) if flip_y else (page_height_pt - raw_dy + 2)
 
         logger.info(
-            "Date draw → text='%s' font=%.1fpt | "
+            "📅 Date draw → text='%s' font=%.1fpt | "
             "input(dx=%.2f%%, dy=%.2f%%) → rl(%.2f, %.2f)pt",
             date_text, date_font_size,
             dx_pct, dy_pct,
@@ -302,19 +296,24 @@ def stamp_endpoint():
     flip_x               = bool(data.get("flip_x", False))
     flip_y               = bool(data.get("flip_y", False))
 
-    # ── DEBUG: log all incoming size params ────────────────
-    logger.info(
-        "INCOMING → x=%.2f%% y=%.2f%% | "
-        "stamp_width_percent=%s stamp_height_percent=%s | "
-        "stamp_width_px=%s stamp_height_px=%s | "
-        "date='%s' date_x=%s date_y=%s font=%s | "
-        "pages='%s' occurrence='%s' flip_x=%s flip_y=%s",
-        x_pct, y_pct,
-        stamp_width_percent, stamp_height_percent,
-        stamp_width_px, stamp_height_px,
-        date_text or "", date_x_percent, date_y_percent, date_font_size,
-        pages, occurrence, flip_x, flip_y,
-    )
+    # ── LOG EVERY INCOMING REQUEST FULLY ──────────────────
+    logger.info("=" * 60)
+    logger.info("📥 INCOMING REQUEST")
+    logger.info("  x_percent            = %s", x_pct)
+    logger.info("  y_percent            = %s", y_pct)
+    logger.info("  stamp_width_percent  = %s", stamp_width_percent)   # <-- WATCH THIS
+    logger.info("  stamp_height_percent = %s", stamp_height_percent)  # <-- WATCH THIS
+    logger.info("  stamp_width_px       = %s", stamp_width_px)
+    logger.info("  stamp_height_px      = %s", stamp_height_px)
+    logger.info("  date_text            = %s", date_text)
+    logger.info("  date_x_percent       = %s", date_x_percent)
+    logger.info("  date_y_percent       = %s", date_y_percent)
+    logger.info("  date_font_size       = %s", date_font_size)
+    logger.info("  pages                = %s", pages)
+    logger.info("  occurrence           = %s", occurrence)
+    logger.info("  flip_x               = %s", flip_x)
+    logger.info("  flip_y               = %s", flip_y)
+    logger.info("=" * 60)
 
     # ── Decode base64 ──────────────────────────────────────
     try:
@@ -342,12 +341,12 @@ def stamp_endpoint():
             flip_y               = flip_y,
         )
     except Exception as e:
-        logger.exception("stamp_pdf failed")
+        logger.exception("❌ stamp_pdf failed")
         return jsonify({"error": str(e)}), 500
 
     # ── Encode and return ──────────────────────────────────
     result_b64 = base64.b64encode(result_bytes).decode("utf-8")
-    logger.info("Done → output b64 len: %d", len(result_b64))
+    logger.info("✅ Done → output b64 len: %d", len(result_b64))
 
     return jsonify({
         "pdf":         result_b64,
