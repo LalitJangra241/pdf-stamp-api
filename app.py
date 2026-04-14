@@ -2,6 +2,7 @@
 PDF Stamp API
 =============
 POST /stamp   — stamps a PDF with an image + timestamp text
+POST /resize  — resizes a stamp image to exact pt dimensions
 GET  /health  — health check, returns status + features
 
 Required packages:
@@ -37,7 +38,7 @@ from reportlab.lib.utils import ImageReader
 # App setup
 # ──────────────────────────────────────────────────────────
 
-app = FastAPI(title="PDF Stamp API", version="2.1.0")
+app = FastAPI(title="PDF Stamp API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,7 +55,7 @@ API_KEY = "pdf-stamp-api"
 
 class StampRequest(BaseModel):
     pdf:                  str   = Field(..., description="Base64-encoded input PDF")
-    stamp:                str   = Field(..., description="Base64-encoded stamp image (PNG/JPG)")
+    stamp:                str   = Field(..., description="Base64-encoded stamp image (PNG/JPG) — pre-resized")
     x_percent:            float = Field(..., ge=0, le=100, description="Stamp left edge as % of page width")
     y_percent:            float = Field(..., ge=0, le=100, description="Stamp top edge as % of page height")
     stamp_width_percent:  float = Field(..., gt=0, le=100, description="Stamp width as % of page width")
@@ -75,6 +76,22 @@ class StampResponse(BaseModel):
     page_h_in:    float          # Page height in inches
     page_label:   str            # e.g. "A4 Portrait", "Letter Landscape"
     total_pages:  int            # Number of pages in the PDF
+
+
+class ResizeRequest(BaseModel):
+    stamp:      str   = Field(..., description="Base64-encoded stamp image (PNG/JPG/RGBA)")
+    width_pt:   float = Field(..., gt=0, description="Target width in PDF points")
+    height_pt:  float = Field(..., gt=0, description="Target height in PDF points")
+    dpi:        float = Field(default=150.0, gt=0, description="DPI used to convert pt → pixels (default 150)")
+
+
+class ResizeResponse(BaseModel):
+    stamp:       str    # Base64-encoded resized PNG (RGBA preserved)
+    width_px:    int    # Actual pixel width of resized image
+    height_px:   int    # Actual pixel height of resized image
+    width_pt:    float  # Requested width in pt (echoed back)
+    height_pt:   float  # Requested height in pt (echoed back)
+    dpi:         float  # DPI used for conversion
 
 
 class HealthResponse(BaseModel):
@@ -124,7 +141,7 @@ def _build_overlay(
 ) -> bytes:
     """
     Build a single-page transparent PDF overlay containing:
-      • the stamp image
+      • the stamp image (already pre-resized by /resize endpoint)
       • the date text
 
     All coordinates use PDF convention (origin = bottom-left).
@@ -146,7 +163,7 @@ def _build_overlay(
     # Date text y: from top → PDF origin; subtract one line height (≈ font size)
     dy_pt  = page_h_pt - (dy_pct / 100.0) * page_h_pt - scaled_font
 
-    # Decode stamp image
+    # Decode stamp image (already resized)
     stamp_bytes = base64.b64decode(stamp_b64)
     stamp_img   = Image.open(io.BytesIO(stamp_bytes)).convert("RGBA")
 
@@ -181,14 +198,71 @@ def _build_overlay(
 def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
-        version="2.1.0",
+        version="2.2.0",
         features=[
             "stamp",
+            "resize",
             "page_size_detection",
             "multi_page_pdf",
             "font_auto_scale",
             "cross_check_mediabox",
         ],
+    )
+
+
+@app.post("/resize", response_model=ResizeResponse)
+def resize_stamp(
+    body:      ResizeRequest,
+    x_api_key: Optional[str] = Header(None),
+) -> ResizeResponse:
+    """
+    Resize a stamp image to exact PDF point dimensions.
+
+    Converts pt → px using the provided DPI (default 150):
+        px = round(pt / 72 * dpi)
+
+    Returns a PNG (RGBA preserved) as base64.
+    """
+
+    # ── Auth ────────────────────────────────────────────────
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+
+    # ── Decode image ────────────────────────────────────────
+    try:
+        img_bytes = base64.b64decode(body.stamp)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 stamp: {exc}")
+
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot open stamp image: {exc}")
+
+    # ── Calculate target pixel size ─────────────────────────
+    # pt → inches → pixels
+    target_w_px = max(1, round(body.width_pt  / 72.0 * body.dpi))
+    target_h_px = max(1, round(body.height_pt / 72.0 * body.dpi))
+
+    # ── Resize with high-quality Lanczos resampling ─────────
+    try:
+        resized = img.resize((target_w_px, target_h_px), Image.LANCZOS)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Resize failed: {exc}")
+
+    # ── Encode as PNG (preserves RGBA / transparency) ───────
+    out_buf = io.BytesIO()
+    resized.save(out_buf, format="PNG", optimize=False)
+    out_buf.seek(0)
+    resized_b64 = base64.b64encode(out_buf.read()).decode()
+
+    return ResizeResponse(
+        stamp      = resized_b64,
+        width_px   = target_w_px,
+        height_px  = target_h_px,
+        width_pt   = body.width_pt,
+        height_pt  = body.height_pt,
+        dpi        = body.dpi,
     )
 
 
@@ -217,16 +291,16 @@ def stamp_pdf(
     if len(reader.pages) == 0:
         raise HTTPException(status_code=400, detail="PDF has no pages")
 
-    page_0   = reader.pages[0]
+    page_0    = reader.pages[0]
     page_w_pt = float(page_0.mediabox.width)
     page_h_pt = float(page_0.mediabox.height)
     total_pages = len(reader.pages)
 
     # Derived size fields
-    page_w_mm = round(page_w_pt / 2.83465, 3)
-    page_h_mm = round(page_h_pt / 2.83465, 3)
-    page_w_in = round(page_w_pt / 72.0, 4)
-    page_h_in = round(page_h_pt / 72.0, 4)
+    page_w_mm  = round(page_w_pt / 2.83465, 3)
+    page_h_mm  = round(page_h_pt / 2.83465, 3)
+    page_w_in  = round(page_w_pt / 72.0, 4)
+    page_h_in  = round(page_h_pt / 72.0, 4)
     page_label = guess_page_size(page_w_pt, page_h_pt)
 
     # ── Build overlay ───────────────────────────────────────
