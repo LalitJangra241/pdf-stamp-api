@@ -1,461 +1,278 @@
 """
-PDF STAMP API — Flask Server
-============================
+PDF Stamp API
+=============
+POST /stamp   — stamps a PDF with an image + timestamp text
+GET  /health  — health check, returns status + features
 
-All position + size values are PERCENTAGES (%) of page dimensions.
-Stamp size auto-scales with page size — works correctly for A4, A3,
-or any other page size without changing the sheet values.
+Required packages:
+  pip install fastapi uvicorn pypdf pillow reportlab python-multipart
 
-Sheet column mapping (rows 12+, one row per signatory):
-  A = Name
-  B = Role / dept
-  C = Doer Sign Stamp URL       → stamp image
-  D = Doer Sign Stamp X %       → x_percent         (% of page width)
-  E = Doer Sign Stamp Y %       → y_percent         (% of page height)
-  F = Timestamp text            → date_text
-  G = Timestamp X %             → date_x_percent    (% of page width)
-  H = Timestamp Y %             → date_y_percent    (% of page height)
-  I = STAMP_WIDTH %             → stamp_width_percent   (e.g. 7 = 7% of page width)
-  J = STAMP_HEIGHT %            → stamp_height_percent  (e.g. 7 = 7% of page height)
-  K = Timestamp_FONT_SIZE (pt)  → date_font_size (A4 base, auto-scales with page)
-
-Fixed cells:
-  C2  = Form submission timestamp
-  C10 = PDF Drive link
-
-How stamp size scales with page:
-  stamp_width_pt  = (stamp_width_percent  / 100) * page_width_pt
-  stamp_height_pt = (stamp_height_percent / 100) * page_height_pt
-
-  Example — 7% on different page sizes:
-    A4 landscape (841pt wide)  → 7% → 58.9pt (20.8mm)
-    A3 landscape (1191pt wide) → 7% → 83.4pt (29.4mm)  ← auto-larger, no changes needed
-
-Endpoints:
-  GET  /health  → health check / server wake
-  POST /stamp   → stamp PDF, returns base64 PDF
-
-Auth     : x-api-key header
-Max size : 50 MB
-Response : { "pdf": "<base64>", "stamped_pdf": "<base64>" }
+Run:
+  uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
-import os
-import io
+from __future__ import annotations
+
 import base64
-import logging
-from functools import lru_cache
+import io
+import math
+from typing import Optional
 
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# PDF read / write
 from pypdf import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-from PIL import Image
-
-# ─────────────────────────────────────────────────────────
-# SETUP
-# ─────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+from pypdf.generic import (
+    ArrayObject, FloatObject, NameObject, RectangleObject
 )
-logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# Image + drawing
+from PIL import Image
+from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.lib.utils import ImageReader
 
-API_KEY          = os.environ.get("PDF_STAMP_API_KEY", "pdf-stamp-api")
-MAX_BODY_BYTES   = 50 * 1024 * 1024
-A4_HEIGHT_PT     = 841.89   # A4 landscape height (long edge) used as font scale base
-DEFAULT_SIZE_PCT = 7.0      # fallback if width/height percent missing
+# ──────────────────────────────────────────────────────────
+# App setup
+# ──────────────────────────────────────────────────────────
 
+app = FastAPI(title="PDF Stamp API", version="2.1.0")
 
-# ─────────────────────────────────────────────────────────
-# UTILITIES
-# ─────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def check_auth(req) -> bool:
-    return req.headers.get("x-api-key") == API_KEY
+API_KEY = "pdf-stamp-api"
 
+# ──────────────────────────────────────────────────────────
+# Request / response models
+# ──────────────────────────────────────────────────────────
 
-def _to_float(value, default=None):
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-@lru_cache(maxsize=256)
-def _parse_pages_cached(page_str: str, total_pages: int) -> tuple:
-    if not page_str or page_str.strip().lower() == "all":
-        return tuple(range(total_pages))
-    indices = set()
-    for part in page_str.split(","):
-        part = part.strip()
-        if "-" in part:
-            s, e = part.split("-", 1)
-            for p in range(int(s), int(e) + 1):
-                if 1 <= p <= total_pages:
-                    indices.add(p - 1)
-        else:
-            p = int(part)
-            if 1 <= p <= total_pages:
-                indices.add(p - 1)
-    return tuple(sorted(indices))
+class StampRequest(BaseModel):
+    pdf:                  str   = Field(..., description="Base64-encoded input PDF")
+    stamp:                str   = Field(..., description="Base64-encoded stamp image (PNG/JPG)")
+    x_percent:            float = Field(..., ge=0, le=100, description="Stamp left edge as % of page width")
+    y_percent:            float = Field(..., ge=0, le=100, description="Stamp top edge as % of page height")
+    stamp_width_percent:  float = Field(..., gt=0, le=100, description="Stamp width as % of page width")
+    stamp_height_percent: float = Field(..., gt=0, le=100, description="Stamp height as % of page height")
+    date_text:            str   = Field(..., description="Timestamp text to render (e.g. 14/04/2026)")
+    date_x_percent:       float = Field(..., ge=0, le=100, description="Timestamp left edge as % of page width")
+    date_y_percent:       float = Field(..., ge=0, le=100, description="Timestamp top edge as % of page height")
+    date_font_size:       float = Field(..., gt=0, description="Font size in pt (calibrated for A4; auto-scaled by API)")
 
 
-def parse_pages(page_str: str, total_pages: int) -> list:
-    return list(_parse_pages_cached(str(page_str).strip(), total_pages))
+class StampResponse(BaseModel):
+    pdf:          str            # Base64-encoded stamped PDF
+    page_w_pt:    float          # Page width  in points
+    page_h_pt:    float          # Page height in points
+    page_w_mm:    float          # Page width  in mm
+    page_h_mm:    float          # Page height in mm
+    page_w_in:    float          # Page width  in inches
+    page_h_in:    float          # Page height in inches
+    page_label:   str            # e.g. "A4 Portrait", "Letter Landscape"
+    total_pages:  int            # Number of pages in the PDF
 
 
-def filter_occurrence(indices: list, occurrence: str) -> list:
-    if not indices:
-        return indices
-    occ = str(occurrence).strip().lower()
-    if occ == "first": return [indices[0]]
-    if occ == "last":  return [indices[-1]]
-    return indices
+class HealthResponse(BaseModel):
+    status:   str
+    version:  str
+    features: list[str]
 
 
-# ─────────────────────────────────────────────────────────
-# STAMP SIZE — scales automatically with page dimensions
-# ─────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# Helper: guess page name from dimensions
+# ──────────────────────────────────────────────────────────
 
-def resolve_stamp_size(page_w, page_h, stamp_width_percent, stamp_height_percent):
+_PAGE_SIZES = [
+    ("A3",      841.89,  1190.55),
+    ("A4",      595.28,   841.89),
+    ("A5",      419.53,   595.28),
+    ("Letter",  612.00,   792.00),
+    ("Legal",   612.00,  1008.00),
+    ("Tabloid", 792.00,  1224.00),
+]
+
+def guess_page_size(w_pt: float, h_pt: float) -> str:
+    s, l   = min(w_pt, h_pt), max(w_pt, h_pt)
+    orient = "Portrait" if w_pt <= h_pt else "Landscape"
+    for name, sw, sl in _PAGE_SIZES:
+        if abs(s - sw) < 6 and abs(l - sl) < 6:
+            return f"{name} {orient}"
+    return f"Custom {orient} ({w_pt:.1f} × {h_pt:.1f} pt)"
+
+
+# ──────────────────────────────────────────────────────────
+# Helper: render overlay (stamp image + date text) as PDF
+# ──────────────────────────────────────────────────────────
+
+def _build_overlay(
+    page_w_pt:  float,
+    page_h_pt:  float,
+    stamp_b64:  str,
+    x_pct:      float,
+    y_pct:      float,
+    sw_pct:     float,
+    sh_pct:     float,
+    date_text:  str,
+    dx_pct:     float,
+    dy_pct:     float,
+    font_size:  float,
+) -> bytes:
     """
-    Convert percentage inputs to point values for this specific page.
+    Build a single-page transparent PDF overlay containing:
+      • the stamp image
+      • the date text
 
-    stamp_width_percent  → col I  (e.g. 7 = 7% of page width)
-    stamp_height_percent → col J  (e.g. 7 = 7% of page height)
-
-    This means a 7% stamp on A4 landscape (841pt × 595pt) renders as:
-      width  = 7% × 841 = 58.9pt = 20.8mm
-      height = 7% × 595 = 41.7pt = 14.7mm
-
-    On A3 landscape (1191pt × 842pt) the same 7% gives:
-      width  = 7% × 1191 = 83.4pt = 29.4mm  ← proportionally larger, no sheet changes needed
-      height = 7% × 842  = 58.9pt = 20.8mm
+    All coordinates use PDF convention (origin = bottom-left).
+    The y_percent / date_y_percent values come from the sheet as
+    "% from top", so we convert: pdf_y = page_h - top_pt - element_h
     """
-    if stamp_width_percent is not None and stamp_height_percent is not None:
-        sw = float(stamp_width_percent)
-        sh = float(stamp_height_percent)
 
-        if sw <= 0 or sh <= 0:
-            raise ValueError(
-                f"stamp_width_percent and stamp_height_percent must be > 0. "
-                f"Got: W={sw}% H={sh}%"
-            )
+    # Convert percentages → points
+    sw_pt  = (sw_pct  / 100.0) * page_w_pt
+    sh_pt  = (sh_pct  / 100.0) * page_h_pt
+    x_pt   = (x_pct   / 100.0) * page_w_pt
+    # y_pct is "from top" → convert to PDF bottom-left origin
+    y_pt   = page_h_pt - (y_pct / 100.0) * page_h_pt - sh_pt
 
-        sw_pt = (sw / 100.0) * page_w
-        sh_pt = (sh / 100.0) * page_h
+    dx_pt  = (dx_pct  / 100.0) * page_w_pt
+    # Scale font from A4 reference
+    A4_H   = 841.89
+    scaled_font = font_size * (page_h_pt / A4_H)
+    # Date text y: from top → PDF origin; subtract one line height (≈ font size)
+    dy_pt  = page_h_pt - (dy_pct / 100.0) * page_h_pt - scaled_font
 
-        logger.info(
-            "Stamp size | page=%.1f×%.1fpt | "
-            "W=%.1f%%→%.2fpt(%.1fmm) | H=%.1f%%→%.2fpt(%.1fmm)",
-            page_w, page_h,
-            sw, sw_pt, sw_pt / 2.835,
-            sh, sh_pt, sh_pt / 2.835,
-        )
-        return sw, sh   # return original pct values; build_stamp_overlay converts to pt
+    # Decode stamp image
+    stamp_bytes = base64.b64decode(stamp_b64)
+    stamp_img   = Image.open(io.BytesIO(stamp_bytes)).convert("RGBA")
 
-    logger.warning(
-        "stamp_width/height_percent missing — using fallback %.1f%%×%.1f%%",
-        DEFAULT_SIZE_PCT, DEFAULT_SIZE_PCT,
-    )
-    return DEFAULT_SIZE_PCT, DEFAULT_SIZE_PCT
+    # Build overlay PDF in memory with ReportLab
+    buf = io.BytesIO()
+    c   = rl_canvas.Canvas(buf, pagesize=(page_w_pt, page_h_pt))
 
-
-# ─────────────────────────────────────────────────────────
-# OVERLAY BUILDER
-# ─────────────────────────────────────────────────────────
-
-def build_stamp_overlay(page_w, page_h, stamp_img_bytes,
-                        x_pct, y_pct,
-                        sw_pct, sh_pct,
-                        date_text=None,
-                        date_x_pct=None, date_y_pct=None,
-                        date_font_size=6.0,
-                        flip_x=False, flip_y=False) -> bytes:
-    """
-    Render stamp image + optional timestamp onto a transparent PDF overlay.
-
-    Coordinate system:
-      - Inputs use TOP-LEFT origin (same as Google Sheet / screen coordinates).
-      - ReportLab uses BOTTOM-LEFT origin — converted internally.
-
-    Font scaling:
-      date_font_size is specified for A4 (841.89pt tall in landscape).
-      It is scaled proportionally to the actual page height so text
-      stays visually the same size on any page format.
-    """
-    packet = io.BytesIO()
-    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
-
-    # Convert % → absolute pt
-    sw    = (sw_pct / 100.0) * page_w
-    sh    = (sh_pct / 100.0) * page_h
-    raw_x = (x_pct  / 100.0) * page_w
-    raw_y = (y_pct  / 100.0) * page_h
-
-    # Convert top-left origin → ReportLab bottom-left origin
-    stamp_x = (page_w - raw_x - sw) if flip_x else raw_x
-    stamp_y = raw_y                  if flip_y else (page_h - raw_y - sh)
-
-    logger.info(
-        "Stamp | page=%.1f×%.1fpt | size=%.1f×%.1fpt(%.1f×%.1fmm) | "
-        "pos=(%.2f%%,%.2f%%) → rl=(%.1f,%.1f)pt",
-        page_w, page_h,
-        sw, sh, sw / 2.835, sh / 2.835,
-        x_pct, y_pct, stamp_x, stamp_y,
+    # Draw stamp image
+    img_reader = ImageReader(stamp_img)
+    c.drawImage(
+        img_reader,
+        x_pt, y_pt,
+        width=sw_pt, height=sh_pt,
+        mask="auto",          # preserve transparency
     )
 
-    # Draw stamp image (PNG transparency supported via RGBA conversion)
-    try:
-        with Image.open(io.BytesIO(stamp_img_bytes)) as img:
-            img_reader = ImageReader(img.convert("RGBA"))
-            c.drawImage(img_reader, stamp_x, stamp_y,
-                        width=sw, height=sh, mask="auto")
-    except Exception as exc:
-        logger.error("Failed to draw stamp image: %s", exc)
-        raise
-
-    # Draw optional timestamp text
-    if date_text:
-        dx_pct = date_x_pct if date_x_pct is not None else x_pct
-        dy_pct = date_y_pct if date_y_pct is not None else y_pct
-
-        raw_dx = (dx_pct / 100.0) * page_w
-        raw_dy = (dy_pct / 100.0) * page_h
-
-        # Scale font proportionally to page height vs A4 landscape
-        scaled_font = date_font_size * (page_h / A4_HEIGHT_PT)
-
-        date_x = (page_w - raw_dx) if flip_x else raw_dx
-        # Baseline sits 2pt above the stamp's top edge
-        date_y = (raw_dy + sh + 2) if flip_y else (page_h - raw_dy + 2)
-
-        logger.info(
-            "Date | text='%s' font=%.1fpt (scaled from %.1fpt for A4) | "
-            "pos=(%.2f%%,%.2f%%) → rl=(%.1f,%.1f)pt",
-            date_text, scaled_font, date_font_size,
-            dx_pct, dy_pct, date_x, date_y,
-        )
-
-        c.setFont("Helvetica", scaled_font)
-        c.setFillColorRGB(0, 0, 0)
-        c.drawString(date_x, date_y, str(date_text))
+    # Draw date text
+    c.setFont("Helvetica-Bold", scaled_font)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(dx_pt, dy_pt, date_text)
 
     c.save()
-    return packet.getvalue()
+    buf.seek(0)
+    return buf.read()
 
 
-# ─────────────────────────────────────────────────────────
-# CORE STAMP FUNCTION
-# ─────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# Endpoints
+# ──────────────────────────────────────────────────────────
 
-def stamp_pdf(pdf_bytes, stamp_bytes,
-              x_pct, y_pct,
-              stamp_width_percent, stamp_height_percent,
-              date_text=None, date_x_pct=None, date_y_pct=None,
-              date_font_size=6.0,
-              pages="all", occurrence="all",
-              flip_x=False, flip_y=False) -> bytes:
-    """
-    Apply a single stamp to selected pages of the PDF.
-
-    Page size is read per-page from the PDF so mixed-size PDFs are handled
-    correctly — stamp percentages are resolved fresh for each page.
-
-    The Apps Script calls this once per signatory row, passing the output
-    of the previous call as the next input (chained stamping).
-    """
-    reader       = PdfReader(io.BytesIO(pdf_bytes))
-    writer       = PdfWriter()
-    total        = len(reader.pages)
-    page_indices = filter_occurrence(parse_pages(pages, total), occurrence)
-    stamp_set    = set(page_indices)
-
-    logger.info("PDF: %d page(s) | stamping pages: %s", total, [p + 1 for p in page_indices])
-
-    for idx in range(total):
-        page   = reader.pages[idx]
-        page_w = float(page.mediabox.width)
-        page_h = float(page.mediabox.height)
-
-        if idx in stamp_set:
-            logger.info("Page %d | %.1f × %.1f pt (%.1f × %.1f mm)",
-                        idx + 1, page_w, page_h, page_w / 2.835, page_h / 2.835)
-
-            sw_pct, sh_pct = resolve_stamp_size(
-                page_w, page_h,
-                stamp_width_percent,
-                stamp_height_percent,
-            )
-
-            overlay_bytes = build_stamp_overlay(
-                page_w, page_h, stamp_bytes,
-                x_pct, y_pct,
-                sw_pct, sh_pct,
-                date_text      = date_text,
-                date_x_pct     = date_x_pct,
-                date_y_pct     = date_y_pct,
-                date_font_size = date_font_size,
-                flip_x         = flip_x,
-                flip_y         = flip_y,
-            )
-            page.merge_page(PdfReader(io.BytesIO(overlay_bytes)).pages[0])
-
-        writer.add_page(page)
-
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(
+        status="ok",
+        version="2.1.0",
+        features=[
+            "stamp",
+            "page_size_detection",
+            "multi_page_pdf",
+            "font_auto_scale",
+            "cross_check_mediabox",
+        ],
+    )
 
 
-# ─────────────────────────────────────────────────────────
-# ROUTES
-# ─────────────────────────────────────────────────────────
+@app.post("/stamp", response_model=StampResponse)
+def stamp_pdf(
+    body:      StampRequest,
+    x_api_key: Optional[str] = Header(None),
+) -> StampResponse:
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
+    # ── Auth ────────────────────────────────────────────────
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
 
-
-@app.route("/stamp", methods=["POST"])
-def stamp_endpoint():
-    """
-    Required JSON fields
-    ────────────────────
-    pdf                  : base64-encoded PDF bytes
-    stamp                : base64-encoded stamp image (PNG with transparency recommended)
-    x_percent            : stamp left edge  — % of page width    (col D)
-    y_percent            : stamp top  edge  — % of page height   (col E)
-    stamp_width_percent  : stamp width      — % of page width    (col I, e.g. 7)
-    stamp_height_percent : stamp height     — % of page height   (col J, e.g. 7)
-
-    Optional timestamp fields
-    ─────────────────────────
-    date_text            : e.g. "10/04/2026"                      (col F)
-    date_x_percent       : timestamp left   — % of page width     (col G)
-    date_y_percent       : timestamp top    — % of page height    (col H)
-    date_font_size       : pt size for A4, auto-scales to page    (col K)
-
-    Other options
-    ─────────────
-    pages      : "all" | "1" | "1-3" | "1,3,5"    (default "all")
-    occurrence : "all" | "first" | "last"           (default "all")
-    flip_x     : boolean                            (default false)
-    flip_y     : boolean                            (default false)
-
-    Response
-    ────────
-    200 → { "pdf": "<base64>", "stamped_pdf": "<base64>" }
-    4xx → { "error": "<message>" }
-    5xx → { "error": "<message>" }
-    """
-
-    if not check_auth(request):
-        logger.warning("Unauthorized request from %s", request.remote_addr)
-        return jsonify({"error": "Unauthorized"}), 401
-
-    cl = request.content_length
-    if cl and cl > MAX_BODY_BYTES:
-        return jsonify({"error": f"Request too large (max {MAX_BODY_BYTES // 1024 // 1024} MB)"}), 413
-
+    # ── Decode PDF ─────────────────────────────────────────
     try:
-        data = request.get_json(force=True, silent=False)
-    except Exception:
-        return jsonify({"error": "Invalid JSON body"}), 400
-    if not data:
-        return jsonify({"error": "Empty request body"}), 400
+        pdf_bytes = base64.b64decode(body.pdf)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 PDF: {exc}")
 
-    # ── Required fields ───────────────────────────────────
-    pdf_b64     = data.get("pdf")
-    stamp_b64   = data.get("stamp")
-    x_pct       = _to_float(data.get("x_percent"))
-    y_pct       = _to_float(data.get("y_percent"))
-    stamp_w_pct = _to_float(data.get("stamp_width_percent"))
-    stamp_h_pct = _to_float(data.get("stamp_height_percent"))
-
-    if not pdf_b64:         return jsonify({"error": "Missing: pdf"}), 400
-    if not stamp_b64:       return jsonify({"error": "Missing: stamp"}), 400
-    if x_pct       is None: return jsonify({"error": "Missing: x_percent (col D)"}), 400
-    if y_pct       is None: return jsonify({"error": "Missing: y_percent (col E)"}), 400
-    if stamp_w_pct is None: return jsonify({"error": "Missing: stamp_width_percent (col I)"}), 400
-    if stamp_h_pct is None: return jsonify({"error": "Missing: stamp_height_percent (col J)"}), 400
-
-    if not (0 <= x_pct       <= 100): return jsonify({"error": f"x_percent out of range: {x_pct}"}), 400
-    if not (0 <= y_pct       <= 100): return jsonify({"error": f"y_percent out of range: {y_pct}"}), 400
-    if not (0 <  stamp_w_pct <= 100): return jsonify({"error": f"stamp_width_percent out of range: {stamp_w_pct}"}), 400
-    if not (0 <  stamp_h_pct <= 100): return jsonify({"error": f"stamp_height_percent out of range: {stamp_h_pct}"}), 400
-
-    # ── Optional timestamp ────────────────────────────────
-    date_text  = data.get("date_text")   or None
-    date_x_pct = _to_float(data.get("date_x_percent"))
-    date_y_pct = _to_float(data.get("date_y_percent"))
-    font_size  = _to_float(data.get("date_font_size"), 6.0)
-
-    if date_text and (font_size is None or font_size <= 0):
-        return jsonify({"error": f"date_font_size must be > 0 when date_text is set. Got: {font_size}"}), 400
-
-    # ── Other options ─────────────────────────────────────
-    pages      = data.get("pages", "all")
-    occurrence = data.get("occurrence", "all")
-    flip_x     = bool(data.get("flip_x", False))
-    flip_y     = bool(data.get("flip_y", False))
-
-    logger.info("=" * 60)
-    logger.info("INCOMING /stamp")
-    logger.info("  x_percent            = %s  (col D)", x_pct)
-    logger.info("  y_percent            = %s  (col E)", y_pct)
-    logger.info("  stamp_width_percent  = %s  (col I — e.g. 7 = 7%% of page width)", stamp_w_pct)
-    logger.info("  stamp_height_percent = %s  (col J — e.g. 7 = 7%% of page height)", stamp_h_pct)
-    logger.info("  date_text            = %s  (col F)", date_text)
-    logger.info("  date_x_percent       = %s  (col G)", date_x_pct)
-    logger.info("  date_y_percent       = %s  (col H)", date_y_pct)
-    logger.info("  date_font_size       = %s  (col K, A4 base)", font_size)
-    logger.info("  pages                = %s", pages)
-    logger.info("  occurrence           = %s", occurrence)
-    logger.info("=" * 60)
-
+    # ── Read PDF + extract page size ────────────────────────
     try:
-        pdf_bytes   = base64.b64decode(pdf_b64)
-        stamp_bytes = base64.b64decode(stamp_b64)
-    except Exception as e:
-        return jsonify({"error": f"Base64 decode failed: {e}"}), 400
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot parse PDF: {exc}")
 
-    logger.info("PDF: %d bytes | Stamp: %d bytes", len(pdf_bytes), len(stamp_bytes))
+    if len(reader.pages) == 0:
+        raise HTTPException(status_code=400, detail="PDF has no pages")
 
+    page_0   = reader.pages[0]
+    page_w_pt = float(page_0.mediabox.width)
+    page_h_pt = float(page_0.mediabox.height)
+    total_pages = len(reader.pages)
+
+    # Derived size fields
+    page_w_mm = round(page_w_pt / 2.83465, 3)
+    page_h_mm = round(page_h_pt / 2.83465, 3)
+    page_w_in = round(page_w_pt / 72.0, 4)
+    page_h_in = round(page_h_pt / 72.0, 4)
+    page_label = guess_page_size(page_w_pt, page_h_pt)
+
+    # ── Build overlay ───────────────────────────────────────
     try:
-        result = stamp_pdf(
-            pdf_bytes, stamp_bytes,
-            x_pct, y_pct,
-            stamp_width_percent  = stamp_w_pct,
-            stamp_height_percent = stamp_h_pct,
-            date_text            = date_text,
-            date_x_pct           = date_x_pct,
-            date_y_pct           = date_y_pct,
-            date_font_size       = font_size,
-            pages                = pages,
-            occurrence           = occurrence,
-            flip_x               = flip_x,
-            flip_y               = flip_y,
+        overlay_bytes = _build_overlay(
+            page_w_pt  = page_w_pt,
+            page_h_pt  = page_h_pt,
+            stamp_b64  = body.stamp,
+            x_pct      = body.x_percent,
+            y_pct      = body.y_percent,
+            sw_pct     = body.stamp_width_percent,
+            sh_pct     = body.stamp_height_percent,
+            date_text  = body.date_text,
+            dx_pct     = body.date_x_percent,
+            dy_pct     = body.date_y_percent,
+            font_size  = body.date_font_size,
         )
-    except Exception as e:
-        logger.exception("stamp_pdf failed")
-        return jsonify({"error": str(e)}), 500
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Overlay build failed: {exc}")
 
-    out_b64 = base64.b64encode(result).decode("utf-8")
-    logger.info("Done | output b64 length: %d", len(out_b64))
-    return jsonify({"pdf": out_b64, "stamped_pdf": out_b64}), 200
+    # ── Merge overlay onto every page ───────────────────────
+    try:
+        overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
+        overlay_page   = overlay_reader.pages[0]
 
+        writer = PdfWriter()
+        for page in reader.pages:
+            page.merge_page(overlay_page)
+            writer.add_page(page)
 
-# ─────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────
+        out_buf = io.BytesIO()
+        writer.write(out_buf)
+        out_buf.seek(0)
+        stamped_bytes = out_buf.read()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"PDF merge failed: {exc}")
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # ── Return ──────────────────────────────────────────────
+    return StampResponse(
+        pdf         = base64.b64encode(stamped_bytes).decode(),
+        page_w_pt   = round(page_w_pt, 4),
+        page_h_pt   = round(page_h_pt, 4),
+        page_w_mm   = page_w_mm,
+        page_h_mm   = page_h_mm,
+        page_w_in   = page_w_in,
+        page_h_in   = page_h_in,
+        page_label  = page_label,
+        total_pages = total_pages,
+    )
