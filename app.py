@@ -2,6 +2,7 @@
 PDF Stamp API
 =============
 POST /stamp   — stamps a PDF with an image + timestamp text
+              — supports BATCH mode: { pdf: "...", stamps: [...] }
 POST /resize  — resizes a stamp image to exact pt dimensions
 GET  /health  — health check, returns status + features
 
@@ -17,7 +18,7 @@ from __future__ import annotations
 import base64
 import io
 import math
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,7 +39,7 @@ from reportlab.lib.utils import ImageReader
 # App setup
 # ──────────────────────────────────────────────────────────
 
-app = FastAPI(title="PDF Stamp API", version="2.2.0")
+app = FastAPI(title="PDF Stamp API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,17 +54,39 @@ API_KEY = "pdf-stamp-api"
 # Request / response models
 # ──────────────────────────────────────────────────────────
 
-class StampRequest(BaseModel):
-    pdf:                  str   = Field(..., description="Base64-encoded input PDF")
+class StampDescriptor(BaseModel):
+    """A single stamp to apply — used in both single and batch modes."""
     stamp:                str   = Field(..., description="Base64-encoded stamp image (PNG/JPG) — pre-resized")
     x_percent:            float = Field(..., ge=0, le=100, description="Stamp left edge as % of page width")
     y_percent:            float = Field(..., ge=0, le=100, description="Stamp top edge as % of page height")
     stamp_width_percent:  float = Field(..., gt=0, le=100, description="Stamp width as % of page width")
     stamp_height_percent: float = Field(..., gt=0, le=100, description="Stamp height as % of page height")
-    date_text:            str   = Field(..., description="Timestamp text to render (e.g. 14/04/2026)")
-    date_x_percent:       float = Field(..., ge=0, le=100, description="Timestamp left edge as % of page width")
-    date_y_percent:       float = Field(..., ge=0, le=100, description="Timestamp top edge as % of page height")
-    date_font_size:       float = Field(..., gt=0, description="Font size in pt (calibrated for A4; auto-scaled by API)")
+    date_text:            str   = Field(default="", description="Timestamp text to render (e.g. 14/04/2026)")
+    date_x_percent:       float = Field(default=0, ge=0, le=100, description="Timestamp left edge as % of page width")
+    date_y_percent:       float = Field(default=0, ge=0, le=100, description="Timestamp top edge as % of page height")
+    date_font_size:       float = Field(default=1, gt=0, description="Font size in pt (calibrated for A4; auto-scaled by API)")
+
+
+class StampRequest(BaseModel):
+    pdf:    str = Field(..., description="Base64-encoded input PDF")
+
+    # ── Single-stamp fields (legacy / convenience) ──────────
+    stamp:                Optional[str]   = Field(default=None, description="Base64-encoded stamp image — single-stamp mode")
+    x_percent:            Optional[float] = Field(default=None, ge=0, le=100)
+    y_percent:            Optional[float] = Field(default=None, ge=0, le=100)
+    stamp_width_percent:  Optional[float] = Field(default=None, gt=0, le=100)
+    stamp_height_percent: Optional[float] = Field(default=None, gt=0, le=100)
+    date_text:            Optional[str]   = Field(default=None)
+    date_x_percent:       Optional[float] = Field(default=None, ge=0, le=100)
+    date_y_percent:       Optional[float] = Field(default=None, ge=0, le=100)
+    date_font_size:       Optional[float] = Field(default=None, gt=0)
+
+    # ── Batch-stamp field (v2.3.0) ──────────────────────────
+    stamps: Optional[List[StampDescriptor]] = Field(
+        default=None,
+        description="Batch mode: list of stamp descriptors applied in order. "
+                    "If provided, single-stamp fields are ignored."
+    )
 
 
 class StampResponse(BaseModel):
@@ -123,7 +146,7 @@ def guess_page_size(w_pt: float, h_pt: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────
-# Helper: render overlay (stamp image + date text) as PDF
+# Core: build a single overlay PDF (stamp image + date text)
 # ──────────────────────────────────────────────────────────
 
 def _build_overlay(
@@ -180,14 +203,57 @@ def _build_overlay(
         mask="auto",          # preserve transparency
     )
 
-    # Draw date text
-    c.setFont("Helvetica-Bold", scaled_font)
-    c.setFillColorRGB(0, 0, 0)
-    c.drawString(dx_pt, dy_pt, date_text)
+    # Draw date text (only if provided)
+    if date_text and date_text.strip():
+        c.setFont("Helvetica-Bold", scaled_font)
+        c.setFillColorRGB(0, 0, 0)
+        c.drawString(dx_pt, dy_pt, date_text)
 
     c.save()
     buf.seek(0)
     return buf.read()
+
+
+# ──────────────────────────────────────────────────────────
+# Core: apply ONE stamp descriptor to raw PDF bytes
+# Returns stamped PDF bytes.
+# ──────────────────────────────────────────────────────────
+
+def _apply_stamp_to_bytes(
+    pdf_bytes:  bytes,
+    descriptor: StampDescriptor,
+) -> bytes:
+    reader    = PdfReader(io.BytesIO(pdf_bytes))
+    page_0    = reader.pages[0]
+    page_w_pt = float(page_0.mediabox.width)
+    page_h_pt = float(page_0.mediabox.height)
+
+    overlay_bytes = _build_overlay(
+        page_w_pt  = page_w_pt,
+        page_h_pt  = page_h_pt,
+        stamp_b64  = descriptor.stamp,
+        x_pct      = descriptor.x_percent,
+        y_pct      = descriptor.y_percent,
+        sw_pct     = descriptor.stamp_width_percent,
+        sh_pct     = descriptor.stamp_height_percent,
+        date_text  = descriptor.date_text or "",
+        dx_pct     = descriptor.date_x_percent,
+        dy_pct     = descriptor.date_y_percent,
+        font_size  = descriptor.date_font_size,
+    )
+
+    overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
+    overlay_page   = overlay_reader.pages[0]
+
+    writer = PdfWriter()
+    for page in reader.pages:
+        page.merge_page(overlay_page)
+        writer.add_page(page)
+
+    out_buf = io.BytesIO()
+    writer.write(out_buf)
+    out_buf.seek(0)
+    return out_buf.read()
 
 
 # ──────────────────────────────────────────────────────────
@@ -198,9 +264,10 @@ def _build_overlay(
 def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
-        version="2.2.0",
+        version="2.3.0",
         features=[
             "stamp",
+            "batch_stamp",
             "resize",
             "page_size_detection",
             "multi_page_pdf",
@@ -271,6 +338,20 @@ def stamp_pdf(
     body:      StampRequest,
     x_api_key: Optional[str] = Header(None),
 ) -> StampResponse:
+    """
+    Stamp a PDF with one or more stamp images + optional date text.
+
+    ── Single-stamp mode (legacy, unchanged) ──────────────────
+    Pass the top-level stamp / x_percent / y_percent / … fields.
+
+    ── Batch-stamp mode (v2.3.0) ──────────────────────────────
+    Pass a `stamps` array of StampDescriptor objects.
+    The server applies them in order onto the same PDF and
+    returns the final result in one round-trip.
+
+    If `stamps` is present, all top-level single-stamp fields
+    are ignored.
+    """
 
     # ── Auth ────────────────────────────────────────────────
     if x_api_key != API_KEY:
@@ -282,19 +363,19 @@ def stamp_pdf(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 PDF: {exc}")
 
-    # ── Read PDF + extract page size ────────────────────────
+    # ── Read PDF + extract page size (from page 0) ──────────
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
+        _reader_check = PdfReader(io.BytesIO(pdf_bytes))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Cannot parse PDF: {exc}")
 
-    if len(reader.pages) == 0:
+    if len(_reader_check.pages) == 0:
         raise HTTPException(status_code=400, detail="PDF has no pages")
 
-    page_0    = reader.pages[0]
+    page_0    = _reader_check.pages[0]
     page_w_pt = float(page_0.mediabox.width)
     page_h_pt = float(page_0.mediabox.height)
-    total_pages = len(reader.pages)
+    total_pages = len(_reader_check.pages)
 
     # Derived size fields
     page_w_mm  = round(page_w_pt / 2.83465, 3)
@@ -302,6 +383,49 @@ def stamp_pdf(
     page_w_in  = round(page_w_pt / 72.0, 4)
     page_h_in  = round(page_h_pt / 72.0, 4)
     page_label = guess_page_size(page_w_pt, page_h_pt)
+
+    # ════════════════════════════════════════════════════════
+    # BATCH MODE  — stamps[] array present
+    # ════════════════════════════════════════════════════════
+    if body.stamps is not None:
+        if len(body.stamps) == 0:
+            raise HTTPException(status_code=400, detail="stamps array is empty.")
+
+        current_pdf_bytes = pdf_bytes
+        try:
+            for idx, descriptor in enumerate(body.stamps):
+                current_pdf_bytes = _apply_stamp_to_bytes(current_pdf_bytes, descriptor)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Batch stamp failed at stamp index {idx}: {exc}"
+            )
+
+        return StampResponse(
+            pdf         = base64.b64encode(current_pdf_bytes).decode(),
+            page_w_pt   = round(page_w_pt, 4),
+            page_h_pt   = round(page_h_pt, 4),
+            page_w_mm   = page_w_mm,
+            page_h_mm   = page_h_mm,
+            page_w_in   = page_w_in,
+            page_h_in   = page_h_in,
+            page_label  = page_label,
+            total_pages = total_pages,
+        )
+
+    # ════════════════════════════════════════════════════════
+    # SINGLE-STAMP MODE  — legacy behaviour (unchanged)
+    # ════════════════════════════════════════════════════════
+    required = ["stamp", "x_percent", "y_percent",
+                "stamp_width_percent", "stamp_height_percent",
+                "date_text", "date_x_percent", "date_y_percent", "date_font_size"]
+    missing = [f for f in required if getattr(body, f) is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Single-stamp mode requires fields: {missing}. "
+                   "Or use batch mode by passing a `stamps` array."
+        )
 
     # ── Build overlay ───────────────────────────────────────
     try:
@@ -327,7 +451,7 @@ def stamp_pdf(
         overlay_page   = overlay_reader.pages[0]
 
         writer = PdfWriter()
-        for page in reader.pages:
+        for page in _reader_check.pages:
             page.merge_page(overlay_page)
             writer.add_page(page)
 
