@@ -1,13 +1,18 @@
 """
 PDF Stamp API
 =============
-POST /stamp   — stamps a PDF with an image + timestamp text
-              — supports BATCH mode: { pdf: "...", stamps: [...] }
-POST /resize  — resizes a stamp image to exact pt dimensions
-GET  /health  — health check, returns status + features
+POST /stamp     — stamps a PDF with an image + timestamp text
+                — supports BATCH mode: { pdf: "...", stamps: [...] }
+POST /resize    — resizes a stamp image to exact pt dimensions
+POST /compress  — compresses a PDF using Ghostscript (★ NEW v2.8.0)
+GET  /health    — health check, returns status + features
 
 Required packages:
   pip install fastapi uvicorn pypdf pillow reportlab python-multipart
+
+System requirement (for /compress):
+  ghostscript must be installed on the server
+  Render: add  apt-get install -y ghostscript  in your build command or Dockerfile
 
 Run:
   uvicorn main:app --host 0.0.0.0 --port 8000
@@ -17,6 +22,9 @@ from __future__ import annotations
 
 import base64
 import io
+import os
+import subprocess
+import tempfile
 import math
 from typing import Optional, List
 
@@ -26,9 +34,6 @@ from pydantic import BaseModel, Field
 
 # PDF read / write
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import (
-    ArrayObject, FloatObject, NameObject, RectangleObject
-)
 
 # Image + drawing
 from PIL import Image
@@ -39,7 +44,7 @@ from reportlab.lib.utils import ImageReader
 # App setup
 # ──────────────────────────────────────────────────────────
 
-app = FastAPI(title="PDF Stamp API", version="2.3.0")
+app = FastAPI(title="PDF Stamp API", version="2.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,21 +62,21 @@ API_KEY = "pdf-stamp-api"
 class StampDescriptor(BaseModel):
     """A single stamp to apply — used in both single and batch modes."""
     stamp:                str   = Field(..., description="Base64-encoded stamp image (PNG/JPG) — pre-resized")
-    x_percent:            float = Field(..., ge=0, le=100, description="Stamp left edge as % of page width")
-    y_percent:            float = Field(..., ge=0, le=100, description="Stamp top edge as % of page height")
-    stamp_width_percent:  float = Field(..., gt=0, le=100, description="Stamp width as % of page width")
-    stamp_height_percent: float = Field(..., gt=0, le=100, description="Stamp height as % of page height")
-    date_text:            str   = Field(default="", description="Timestamp text to render (e.g. 14/04/2026)")
-    date_x_percent:       float = Field(default=0, ge=0, le=100, description="Timestamp left edge as % of page width")
-    date_y_percent:       float = Field(default=0, ge=0, le=100, description="Timestamp top edge as % of page height")
-    date_font_size:       float = Field(default=1, gt=0, description="Font size in pt (calibrated for A4; auto-scaled by API)")
+    x_percent:            float = Field(..., ge=0, le=100)
+    y_percent:            float = Field(..., ge=0, le=100)
+    stamp_width_percent:  float = Field(..., gt=0, le=100)
+    stamp_height_percent: float = Field(..., gt=0, le=100)
+    date_text:            str   = Field(default="")
+    date_x_percent:       float = Field(default=0, ge=0, le=100)
+    date_y_percent:       float = Field(default=0, ge=0, le=100)
+    date_font_size:       float = Field(default=1, gt=0)
 
 
 class StampRequest(BaseModel):
     pdf:    str = Field(..., description="Base64-encoded input PDF")
 
-    # ── Single-stamp fields (legacy / convenience) ──────────
-    stamp:                Optional[str]   = Field(default=None, description="Base64-encoded stamp image — single-stamp mode")
+    # ── Single-stamp fields (legacy) ─────────────────────────
+    stamp:                Optional[str]   = Field(default=None)
     x_percent:            Optional[float] = Field(default=None, ge=0, le=100)
     y_percent:            Optional[float] = Field(default=None, ge=0, le=100)
     stamp_width_percent:  Optional[float] = Field(default=None, gt=0, le=100)
@@ -81,40 +86,58 @@ class StampRequest(BaseModel):
     date_y_percent:       Optional[float] = Field(default=None, ge=0, le=100)
     date_font_size:       Optional[float] = Field(default=None, gt=0)
 
-    # ── Batch-stamp field (v2.3.0) ──────────────────────────
-    stamps: Optional[List[StampDescriptor]] = Field(
-        default=None,
-        description="Batch mode: list of stamp descriptors applied in order. "
-                    "If provided, single-stamp fields are ignored."
-    )
+    # ── Batch-stamp field ────────────────────────────────────
+    stamps: Optional[List[StampDescriptor]] = Field(default=None)
 
 
 class StampResponse(BaseModel):
-    pdf:          str            # Base64-encoded stamped PDF
-    page_w_pt:    float          # Page width  in points
-    page_h_pt:    float          # Page height in points
-    page_w_mm:    float          # Page width  in mm
-    page_h_mm:    float          # Page height in mm
-    page_w_in:    float          # Page width  in inches
-    page_h_in:    float          # Page height in inches
-    page_label:   str            # e.g. "A4 Portrait", "Letter Landscape"
-    total_pages:  int            # Number of pages in the PDF
+    pdf:          str
+    page_w_pt:    float
+    page_h_pt:    float
+    page_w_mm:    float
+    page_h_mm:    float
+    page_w_in:    float
+    page_h_in:    float
+    page_label:   str
+    total_pages:  int
 
 
 class ResizeRequest(BaseModel):
-    stamp:      str   = Field(..., description="Base64-encoded stamp image (PNG/JPG/RGBA)")
-    width_pt:   float = Field(..., gt=0, description="Target width in PDF points")
-    height_pt:  float = Field(..., gt=0, description="Target height in PDF points")
-    dpi:        float = Field(default=150.0, gt=0, description="DPI used to convert pt → pixels (default 150)")
+    stamp:      str   = Field(..., description="Base64-encoded stamp image")
+    width_pt:   float = Field(..., gt=0)
+    height_pt:  float = Field(..., gt=0)
+    dpi:        float = Field(default=150.0, gt=0)
 
 
 class ResizeResponse(BaseModel):
-    stamp:       str    # Base64-encoded resized PNG (RGBA preserved)
-    width_px:    int    # Actual pixel width of resized image
-    height_px:   int    # Actual pixel height of resized image
-    width_pt:    float  # Requested width in pt (echoed back)
-    height_pt:   float  # Requested height in pt (echoed back)
-    dpi:         float  # DPI used for conversion
+    stamp:       str
+    width_px:    int
+    height_px:   int
+    width_pt:    float
+    height_pt:   float
+    dpi:         float
+
+
+# ★ NEW v2.8.0 ─────────────────────────────────────────────
+class CompressRequest(BaseModel):
+    pdf:     str   = Field(..., description="Base64-encoded PDF to compress")
+    quality: str   = Field(
+        default="ebook",
+        description=(
+            "Ghostscript PDFSETTINGS preset: "
+            "'screen'  = 72 dpi  (smallest file, screen only), "
+            "'ebook'   = 150 dpi (good balance — RECOMMENDED), "
+            "'printer' = 300 dpi (near-lossless, still smaller than input)"
+        )
+    )
+
+
+class CompressResponse(BaseModel):
+    pdf:              str    # Base64-encoded compressed PDF
+    original_size_kb: float  # Input size in KB
+    compressed_size_kb: float  # Output size in KB
+    reduction_pct:    float  # Size reduction as a percentage
+# ──────────────────────────────────────────────────────────
 
 
 class HealthResponse(BaseModel):
@@ -162,48 +185,30 @@ def _build_overlay(
     dy_pct:     float,
     font_size:  float,
 ) -> bytes:
-    """
-    Build a single-page transparent PDF overlay containing:
-      • the stamp image (already pre-resized by /resize endpoint)
-      • the date text
-
-    All coordinates use PDF convention (origin = bottom-left).
-    The y_percent / date_y_percent values come from the sheet as
-    "% from top", so we convert: pdf_y = page_h - top_pt - element_h
-    """
-
-    # Convert percentages → points
     sw_pt  = (sw_pct  / 100.0) * page_w_pt
     sh_pt  = (sh_pct  / 100.0) * page_h_pt
     x_pt   = (x_pct   / 100.0) * page_w_pt
-    # y_pct is "from top" → convert to PDF bottom-left origin
     y_pt   = page_h_pt - (y_pct / 100.0) * page_h_pt - sh_pt
 
     dx_pt  = (dx_pct  / 100.0) * page_w_pt
-    # Scale font from A4 reference
     A4_H   = 841.89
     scaled_font = font_size * (page_h_pt / A4_H)
-    # Date text y: from top → PDF origin; subtract one line height (≈ font size)
     dy_pt  = page_h_pt - (dy_pct / 100.0) * page_h_pt - scaled_font
 
-    # Decode stamp image (already resized)
     stamp_bytes = base64.b64decode(stamp_b64)
     stamp_img   = Image.open(io.BytesIO(stamp_bytes)).convert("RGBA")
 
-    # Build overlay PDF in memory with ReportLab
     buf = io.BytesIO()
     c   = rl_canvas.Canvas(buf, pagesize=(page_w_pt, page_h_pt))
 
-    # Draw stamp image
     img_reader = ImageReader(stamp_img)
     c.drawImage(
         img_reader,
         x_pt, y_pt,
         width=sw_pt, height=sh_pt,
-        mask="auto",          # preserve transparency
+        mask="auto",
     )
 
-    # Draw date text (only if provided)
     if date_text and date_text.strip():
         c.setFont("Helvetica-Bold", scaled_font)
         c.setFillColorRGB(0, 0, 0)
@@ -216,7 +221,6 @@ def _build_overlay(
 
 # ──────────────────────────────────────────────────────────
 # Core: apply ONE stamp descriptor to raw PDF bytes
-# Returns stamped PDF bytes.
 # ──────────────────────────────────────────────────────────
 
 def _apply_stamp_to_bytes(
@@ -257,24 +261,162 @@ def _apply_stamp_to_bytes(
 
 
 # ──────────────────────────────────────────────────────────
+# ★ NEW v2.8.0 — Ghostscript compress helper
+# ──────────────────────────────────────────────────────────
+
+VALID_QUALITY_PRESETS = {"screen", "ebook", "printer", "prepress"}
+
+def _compress_pdf_ghostscript(pdf_bytes: bytes, quality: str = "ebook") -> bytes:
+    """
+    Compress PDF bytes using Ghostscript.
+
+    quality presets map to -dPDFSETTINGS:
+      screen  →  72 dpi  — smallest file size, screen-only
+      ebook   → 150 dpi  — RECOMMENDED for approval workflows
+      printer → 300 dpi  — near-lossless, still smaller than raw
+
+    Returns compressed PDF bytes.
+    Raises RuntimeError if Ghostscript is not installed or fails.
+    """
+    if quality not in VALID_QUALITY_PRESETS:
+        quality = "ebook"
+
+    # Write input to a temp file
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_in:
+        tmp_in.write(pdf_bytes)
+        input_path = tmp_in.name
+
+    output_path = input_path.replace(".pdf", "_compressed.pdf")
+
+    try:
+        result = subprocess.run(
+            [
+                "gs",
+                "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                f"-dPDFSETTINGS=/{quality}",
+                "-dNOPAUSE",
+                "-dQUIET",
+                "-dBATCH",
+                f"-sOutputFile={output_path}",
+                input_path,
+            ],
+            capture_output=True,
+            timeout=120,  # 2-minute max
+        )
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace")
+            raise RuntimeError(f"Ghostscript failed (code {result.returncode}): {stderr[:400]}")
+
+        with open(output_path, "rb") as f:
+            compressed_bytes = f.read()
+
+        # Safety: if Ghostscript somehow made it bigger, return original
+        if len(compressed_bytes) >= len(pdf_bytes):
+            return pdf_bytes
+
+        return compressed_bytes
+
+    finally:
+        # Always clean up temp files
+        for path in (input_path, output_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+# ──────────────────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
+    # Check if Ghostscript is available
+    gs_available = subprocess.run(
+        ["gs", "--version"], capture_output=True
+    ).returncode == 0
+
+    features = [
+        "stamp",
+        "batch_stamp",
+        "resize",
+        "page_size_detection",
+        "multi_page_pdf",
+        "font_auto_scale",
+        "cross_check_mediabox",
+    ]
+    if gs_available:
+        features.append("compress_ghostscript")
+
     return HealthResponse(
         status="ok",
-        version="2.3.0",
-        features=[
-            "stamp",
-            "batch_stamp",
-            "resize",
-            "page_size_detection",
-            "multi_page_pdf",
-            "font_auto_scale",
-            "cross_check_mediabox",
-        ],
+        version="2.8.0",
+        features=features,
     )
+
+
+# ★ NEW v2.8.0 ─────────────────────────────────────────────
+@app.post("/compress", response_model=CompressResponse)
+def compress_pdf(
+    body:      CompressRequest,
+    x_api_key: Optional[str] = Header(None),
+) -> CompressResponse:
+    """
+    Compress a PDF using Ghostscript before stamping.
+
+    Typical results:
+      33 MB PDF  →  ebook quality  →  ~4–6 MB  (85% reduction)
+
+    Requires Ghostscript installed on the server.
+    On Render: add  apt-get install -y ghostscript  to build command.
+    """
+
+    # ── Auth ─────────────────────────────────────────────────
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+
+    # ── Decode PDF ───────────────────────────────────────────
+    try:
+        pdf_bytes = base64.b64decode(body.pdf)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 PDF: {exc}")
+
+    original_size_kb = len(pdf_bytes) / 1024.0
+
+    # ── Validate it's a PDF ──────────────────────────────────
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Provided bytes do not appear to be a valid PDF.")
+
+    # ── Compress ─────────────────────────────────────────────
+    try:
+        compressed_bytes = _compress_pdf_ghostscript(pdf_bytes, body.quality)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Ghostscript (gs) is not installed on this server. "
+                "Add 'apt-get install -y ghostscript' to your Render build command."
+            )
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Compress failed: {exc}")
+
+    compressed_size_kb = len(compressed_bytes) / 1024.0
+    reduction_pct = round(
+        (1.0 - compressed_size_kb / original_size_kb) * 100.0, 1
+    ) if original_size_kb > 0 else 0.0
+
+    return CompressResponse(
+        pdf                = base64.b64encode(compressed_bytes).decode(),
+        original_size_kb   = round(original_size_kb, 2),
+        compressed_size_kb = round(compressed_size_kb, 2),
+        reduction_pct      = reduction_pct,
+    )
+# ──────────────────────────────────────────────────────────
 
 
 @app.post("/resize", response_model=ResizeResponse)
@@ -282,20 +424,9 @@ def resize_stamp(
     body:      ResizeRequest,
     x_api_key: Optional[str] = Header(None),
 ) -> ResizeResponse:
-    """
-    Resize a stamp image to exact PDF point dimensions.
-
-    Converts pt → px using the provided DPI (default 150):
-        px = round(pt / 72 * dpi)
-
-    Returns a PNG (RGBA preserved) as base64.
-    """
-
-    # ── Auth ────────────────────────────────────────────────
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
 
-    # ── Decode image ────────────────────────────────────────
     try:
         img_bytes = base64.b64decode(body.stamp)
     except Exception as exc:
@@ -306,18 +437,14 @@ def resize_stamp(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Cannot open stamp image: {exc}")
 
-    # ── Calculate target pixel size ─────────────────────────
-    # pt → inches → pixels
     target_w_px = max(1, round(body.width_pt  / 72.0 * body.dpi))
     target_h_px = max(1, round(body.height_pt / 72.0 * body.dpi))
 
-    # ── Resize with high-quality Lanczos resampling ─────────
     try:
         resized = img.resize((target_w_px, target_h_px), Image.LANCZOS)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Resize failed: {exc}")
 
-    # ── Encode as PNG (preserves RGBA / transparency) ───────
     out_buf = io.BytesIO()
     resized.save(out_buf, format="PNG", optimize=False)
     out_buf.seek(0)
@@ -338,32 +465,14 @@ def stamp_pdf(
     body:      StampRequest,
     x_api_key: Optional[str] = Header(None),
 ) -> StampResponse:
-    """
-    Stamp a PDF with one or more stamp images + optional date text.
-
-    ── Single-stamp mode (legacy, unchanged) ──────────────────
-    Pass the top-level stamp / x_percent / y_percent / … fields.
-
-    ── Batch-stamp mode (v2.3.0) ──────────────────────────────
-    Pass a `stamps` array of StampDescriptor objects.
-    The server applies them in order onto the same PDF and
-    returns the final result in one round-trip.
-
-    If `stamps` is present, all top-level single-stamp fields
-    are ignored.
-    """
-
-    # ── Auth ────────────────────────────────────────────────
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
 
-    # ── Decode PDF ─────────────────────────────────────────
     try:
         pdf_bytes = base64.b64decode(body.pdf)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 PDF: {exc}")
 
-    # ── Read PDF + extract page size (from page 0) ──────────
     try:
         _reader_check = PdfReader(io.BytesIO(pdf_bytes))
     except Exception as exc:
@@ -372,21 +481,18 @@ def stamp_pdf(
     if len(_reader_check.pages) == 0:
         raise HTTPException(status_code=400, detail="PDF has no pages")
 
-    page_0    = _reader_check.pages[0]
-    page_w_pt = float(page_0.mediabox.width)
-    page_h_pt = float(page_0.mediabox.height)
+    page_0      = _reader_check.pages[0]
+    page_w_pt   = float(page_0.mediabox.width)
+    page_h_pt   = float(page_0.mediabox.height)
     total_pages = len(_reader_check.pages)
 
-    # Derived size fields
     page_w_mm  = round(page_w_pt / 2.83465, 3)
     page_h_mm  = round(page_h_pt / 2.83465, 3)
     page_w_in  = round(page_w_pt / 72.0, 4)
     page_h_in  = round(page_h_pt / 72.0, 4)
     page_label = guess_page_size(page_w_pt, page_h_pt)
 
-    # ════════════════════════════════════════════════════════
-    # BATCH MODE  — stamps[] array present
-    # ════════════════════════════════════════════════════════
+    # ── BATCH MODE ───────────────────────────────────────────
     if body.stamps is not None:
         if len(body.stamps) == 0:
             raise HTTPException(status_code=400, detail="stamps array is empty.")
@@ -413,9 +519,7 @@ def stamp_pdf(
             total_pages = total_pages,
         )
 
-    # ════════════════════════════════════════════════════════
-    # SINGLE-STAMP MODE  — legacy behaviour (unchanged)
-    # ════════════════════════════════════════════════════════
+    # ── SINGLE-STAMP MODE ────────────────────────────────────
     required = ["stamp", "x_percent", "y_percent",
                 "stamp_width_percent", "stamp_height_percent",
                 "date_text", "date_x_percent", "date_y_percent", "date_font_size"]
@@ -427,7 +531,6 @@ def stamp_pdf(
                    "Or use batch mode by passing a `stamps` array."
         )
 
-    # ── Build overlay ───────────────────────────────────────
     try:
         overlay_bytes = _build_overlay(
             page_w_pt  = page_w_pt,
@@ -445,7 +548,6 @@ def stamp_pdf(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Overlay build failed: {exc}")
 
-    # ── Merge overlay onto every page ───────────────────────
     try:
         overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
         overlay_page   = overlay_reader.pages[0]
@@ -462,7 +564,6 @@ def stamp_pdf(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"PDF merge failed: {exc}")
 
-    # ── Return ──────────────────────────────────────────────
     return StampResponse(
         pdf         = base64.b64encode(stamped_bytes).decode(),
         page_w_pt   = round(page_w_pt, 4),
